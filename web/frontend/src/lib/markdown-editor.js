@@ -329,11 +329,11 @@ function escapeRegExp(source) {
 }
 
 function highlightTaskMarkers(html, markers) {
-    const words = (markers || DEFAULT_TASK_MARKERS).filter(Boolean);
+    const words = (markers || DEFAULT_TASK_MARKERS).filter(marker => /^[A-Z][A-Z0-9_-]*$/.test(marker));
     if (!words.length) return html;
     const pattern = new RegExp(
         `(^|[^\\p{L}\\p{N}_])(${words.map(escapeRegExp).join('|')})(?![\\p{L}\\p{N}_])`,
-        'giu'
+        'gu'
     );
     return html.split(/(<[^>]+>)/).map(part => {
         if (part.startsWith('<')) return part;

@@ -68,10 +68,9 @@ func ParseTaskMarkers(raw string) ([]string, error) {
 		if marker == "" {
 			continue
 		}
-		if len([]rune(marker)) > maxTaskMarkerLength || !taskMarkerPattern.MatchString(strings.ToUpper(marker)) {
+		if len([]rune(marker)) > maxTaskMarkerLength || !taskMarkerPattern.MatchString(marker) {
 			return nil, fmt.Errorf("invalid task marker %q", value)
 		}
-		marker = strings.ToUpper(marker)
 		if _, duplicate := seen[marker]; duplicate {
 			continue
 		}
@@ -193,7 +192,7 @@ func extractTasks(content string, markers []string) []taskMatch {
 	}
 	patterns := make([]*regexp.Regexp, 0, len(markers))
 	for _, marker := range markers {
-		patterns = append(patterns, regexp.MustCompile(`(?i)`+regexp.QuoteMeta(marker)))
+		patterns = append(patterns, regexp.MustCompile(regexp.QuoteMeta(marker)))
 	}
 
 	lines := strings.Split(content, "\n")

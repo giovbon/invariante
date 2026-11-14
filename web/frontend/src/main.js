@@ -3022,7 +3022,7 @@ function renderSettingsPanel() {
 
     const tasksDescription = document.createElement('p');
     tasksDescription.className = 'settings-description';
-    tasksDescription.textContent = 'Palavras que identificam tarefas no texto, como TODO: e FIXME:. Separe por vírgula. A lista fica salva no servidor e vale para todos os navegadores.';
+    tasksDescription.textContent = 'Marcadores em MAIÚSCULAS que identificam tarefas no texto, como TODO: e FIXME:. Separe por vírgula. A lista fica salva no servidor e vale para todos os navegadores.';
 
     const markersLabel = document.createElement('label');
     markersLabel.className = 'sr-only';
@@ -3345,10 +3345,10 @@ function parseTaskMarkers(value) {
     const markers = [];
     const seen = new Set();
     for (const raw of String(value ?? '').split(/[\s,;]+/)) {
-        const marker = raw.replace(/:+$/, '').trim().toUpperCase();
+        const marker = raw.replace(/:+$/, '').trim();
         if (!marker) continue;
         if (!/^[A-Z][A-Z0-9_-]{0,31}$/.test(marker)) {
-            return { error: `Marcador de tarefa inválido: “${raw}”.` };
+            return { error: `Marcador de tarefa inválido: “${raw}”. Use apenas letras maiúsculas, números, hífen e sublinhado.` };
         }
         if (seen.has(marker)) continue;
         seen.add(marker);
