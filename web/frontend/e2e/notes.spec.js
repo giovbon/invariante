@@ -16,6 +16,42 @@ test('long notes open scrolled to the top', async ({ page, request }) => {
     expect(await page.locator('#markdownPreview').evaluate(element => element.scrollTop)).toBe(0);
 });
 
+test('switching from reading mode keeps the reading position', async ({ page, request }) => {
+    const title = uniqueTitle('Leitura posição');
+    const content = Array.from({ length: 6 }, (_, chapter) => [
+        `## Capítulo ${chapter + 1}`,
+        '',
+        ...Array.from({ length: 25 }, (_, index) =>
+            `Linha ${chapter + 1}.${index + 1} com algum texto para gerar altura.`)
+    ].join('\n')).join('\n\n');
+    const note = await createNote(request, { title, content });
+    await page.addInitScript(() => localStorage.setItem('editorMode', 'preview'));
+
+    await page.goto(`/?note=${note.id}`);
+    await expect(page.locator('#noteTitle')).toHaveValue(title);
+    await expect(page.locator('.editor-workspace')).toHaveAttribute('data-editor-mode', 'preview');
+
+    const chapter = page.locator('#markdownPreview h2', { hasText: 'Capítulo 4' });
+    await chapter.scrollIntoViewIfNeeded();
+    await expect.poll(() => page.locator('#markdownPreview').evaluate(element => element.scrollTop))
+        .toBeGreaterThan(0);
+    const previewScrollTop = await page.locator('#markdownPreview').evaluate(element => element.scrollTop);
+
+    await page.locator('.editor-mode[data-editor-mode="edit"]').click();
+    await expect(page.locator('.editor-workspace')).toHaveAttribute('data-editor-mode', 'edit');
+    await expect.poll(() => page.locator('#noteContent').evaluate(element => element.scrollTop))
+        .toBeGreaterThan(0);
+
+    await page.locator('.editor-mode[data-editor-mode="preview"]').click();
+    await chapter.scrollIntoViewIfNeeded();
+    await page.locator('.editor-mode[data-editor-mode="split"]').click();
+    await expect(page.locator('.editor-workspace')).toHaveAttribute('data-editor-mode', 'split');
+    await expect.poll(() => page.locator('#noteContent').evaluate(element => element.scrollTop))
+        .toBeGreaterThan(0);
+    await expect.poll(() => page.locator('#markdownPreview').evaluate(element => element.scrollTop))
+        .toBeGreaterThan(previewScrollTop / 2);
+});
+
 test('creates a note, autosaves, survives reload and is searchable', async ({ page }) => {
     const title = uniqueTitle('Nota E2E');
     const content = '# Título\n\nConteúdo persistido.';

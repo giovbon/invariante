@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getScrollSpacerHeight, mapEditorToPreview, mapPreviewToEditor } from './scroll-sync.js';
+import { estimateSourceLine, getScrollSpacerHeight, mapEditorToPreview, mapPreviewToEditor } from './scroll-sync.js';
 
 test('adds preview scroll space when rendered content is shorter than the source', () => {
     assert.equal(getScrollSpacerHeight(300, 200, 600), 700);
@@ -29,4 +29,29 @@ test('scroll mapping always aligns the beginning and end of both panes', () => {
     assert.equal(mapEditorToPreview(1000, 1000, 800, landmarks), 800);
     assert.equal(mapPreviewToEditor(0, 800, 1000, landmarks), 0);
     assert.equal(mapPreviewToEditor(800, 800, 1000, landmarks), 1000);
+});
+
+test('source line estimation interpolates between preview landmarks', () => {
+    const landmarks = [
+        { line: 10, top: 100 },
+        { line: 40, top: 700 }
+    ];
+    assert.equal(estimateSourceLine(100, landmarks), 10);
+    assert.equal(estimateSourceLine(700, landmarks), 40);
+    assert.equal(estimateSourceLine(400, landmarks), 25);
+});
+
+test('source line estimation uses the nearest landmark outside the middle', () => {
+    const landmarks = [
+        { line: 5, top: 100 },
+        { line: 12, top: 300 }
+    ];
+    assert.equal(estimateSourceLine(0, landmarks), 5);
+    assert.equal(estimateSourceLine(250, landmarks), 10.25);
+    assert.equal(estimateSourceLine(900, landmarks), 12);
+});
+
+test('source line estimation falls back when there are no landmarks', () => {
+    assert.equal(estimateSourceLine(0, [], 0), 0);
+    assert.equal(estimateSourceLine(250, [], 37), 37);
 });

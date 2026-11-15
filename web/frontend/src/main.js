@@ -5,7 +5,7 @@ import { GraphView } from './lib/graph-view.js';
 import { iconElement, iconHTML } from './lib/icons.js';
 import { findLinkOccurrence, linkTargetMatches, normalizeLinkPath } from './lib/note-links.js';
 import { highlightCode } from './lib/syntax-highlight.js';
-import { getScrollSpacerHeight, mapEditorToPreview, mapPreviewToEditor } from './lib/scroll-sync.js';
+import { estimateSourceLine, getScrollSpacerHeight, mapEditorToPreview, mapPreviewToEditor } from './lib/scroll-sync.js';
 
 const pageSize = 30;
 const treePageSize = 100;
@@ -154,6 +154,7 @@ let scrollSyncFrame = 0;
 let pendingScrollSource = null;
 let programmaticScroll = null;
 let scrollSyncSuspendedUntil = 0;
+let pendingReadingLine = null;
 const markdownEditor = new MarkdownEditor(elements.noteContent, () => {
     syncMarkdownHighlight();
     syncPreviewMinimumHeight();
@@ -2139,6 +2140,7 @@ function showEditor(note) {
     editorLinePositionCache = null;
     scrollSyncSuspendedUntil = 0;
     programmaticScroll = null;
+    pendingReadingLine = null;
     elements.noteContent.value = content;
     state.savedDraft = getDraft();
     markdownEditor.setValue(content);
@@ -2695,6 +2697,7 @@ function updatePreview() {
         renderFrontmatterProperties();
         renderedPreviewMarkdown = markdown;
         editorLinePositionCache = null;
+        pendingReadingLine = null;
         syncPreviewMinimumHeight();
         syncEditorScrollFromSource();
         runPendingBacklink();
@@ -2724,7 +2727,14 @@ function updatePreview() {
                 syncPreviewMinimumHeight();
                 renderedPreviewMarkdown = markdown;
                 annotatePreviewLandmarks(markdown);
-                syncEditorScrollFromSource();
+                const readingLine = pendingReadingLine;
+                pendingReadingLine = null;
+                if (readingLine !== null) {
+                    scrollEditorToLine(readingLine);
+                    scrollPreviewToSourceLine(readingLine);
+                } else {
+                    syncEditorScrollFromSource();
+                }
                 if (state.pendingOutlineLine !== null) {
                     const pendingLine = state.pendingOutlineLine;
                     state.pendingOutlineLine = null;
@@ -2737,6 +2747,7 @@ function updatePreview() {
             if (requestID === previewRequestID) {
                 elements.markdownPreview.textContent = `Falha ao renderizar Markdown: ${error.message}`;
                 renderedPreviewMarkdown = '';
+                pendingReadingLine = null;
                 renderFrontmatterProperties();
                 syncPreviewMinimumHeight();
                 syncEditorScrollFromSource();
@@ -3023,6 +3034,33 @@ function getScrollLandmarks() {
             anchor.previewTop > 0 && anchor.previewTop < previewScrollable);
 }
 
+// Reading mode scrolls the preview, while the textarea keeps its previous
+// offset. Capture the source line at the top of the preview so switching to
+// edit or split can resume from the same place instead of jumping to the top.
+function previewAnchorSourceLine() {
+    const preview = elements.markdownPreview;
+    if (!preview || preview.clientHeight === 0) return null;
+    const content = elements.noteContent.value;
+    const offset = frontmatterLineOffset(content);
+    const previewRect = preview.getBoundingClientRect();
+    const scrollTop = preview.scrollTop;
+    const landmarks = [];
+    for (const element of preview.children) {
+        if (element.classList.contains('preview-scroll-spacer')) continue;
+        const line = Number(element.dataset.sourceLine);
+        if (!Number.isFinite(line)) continue;
+        landmarks.push({
+            line,
+            top: element.getBoundingClientRect().top - previewRect.top + scrollTop
+        });
+    }
+    const bodyLineCount = Math.max(0, content.split('\n').length - offset);
+    const scrollable = Math.max(0, preview.scrollHeight - preview.clientHeight);
+    const fallback = scrollable > 0 ? (scrollTop / scrollable) * bodyLineCount : 0;
+    const bodyLine = estimateSourceLine(scrollTop, landmarks, fallback);
+    return Math.max(0, Math.round(bodyLine + offset));
+}
+
 function hasPreviewSelection() {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || !selection.rangeCount) return false;
@@ -3088,7 +3126,14 @@ function updateEditorHistoryButtons({ canUndo, canRedo }) {
 
 function setEditorMode(mode) {
     if (mode === 'split' && window.matchMedia('(max-width: 700px)').matches) mode = 'edit';
-    if (elements.editorWorkspace.dataset.editorMode === mode) return;
+    const previousMode = elements.editorWorkspace.dataset.editorMode;
+    if (previousMode === mode) return;
+    // Leaving reading mode must carry the preview position back to the source
+    // editor. Only use the preview when it matches the current text, otherwise
+    // a note switch would map the previous note's scroll position.
+    const readingLine = previousMode === 'preview' && mode !== 'preview' && previewSourceReady()
+        ? previewAnchorSourceLine()
+        : null;
     elements.editorWorkspace.dataset.editorMode = mode;
     localStorage.setItem('editorMode', mode);
     document.querySelectorAll('.editor-mode[data-editor-mode]').forEach(button => {
@@ -3096,15 +3141,24 @@ function setEditorMode(mode) {
         button.classList.toggle('is-active', active);
         button.setAttribute('aria-pressed', String(active));
     });
+    const previewNeedsRender = mode !== 'edit' && !previewSourceReady();
+    pendingReadingLine = readingLine !== null && previewNeedsRender ? readingLine : null;
     if (mode === 'edit') {
         window.clearTimeout(previewTimer);
         previewRequestID++;
-    } else {
+    } else if (previewNeedsRender) {
         updatePreview();
     }
     requestAnimationFrame(() => {
         syncPreviewMinimumHeight();
-        syncEditorScrollFromSource();
+        if (readingLine === null) {
+            syncEditorScrollFromSource();
+        } else if (!previewNeedsRender) {
+            // The preview is still exactly where the user was reading, so only
+            // move the editor to the matching line. The async render path
+            // applies pendingReadingLine after it rebuilds the preview.
+            scrollEditorToLine(readingLine);
+        }
     });
 }
 

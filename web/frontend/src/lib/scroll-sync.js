@@ -34,6 +34,34 @@ export function mapEditorToPreview(scrollTop, editorScrollable, previewScrollabl
     return interpolate(editorPct, anchors, 'editorPct', 'previewTop');
 }
 
+// Estimates which source line is visible at a given preview offset. Landmarks
+// are annotated preview blocks ({ line, top }) sorted by their vertical
+// position, so positions between two landmarks are interpolated.
+export function estimateSourceLine(scrollTop, landmarks = [], fallback = 0) {
+    let before = null;
+    let after = null;
+    for (const landmark of landmarks) {
+        if (!Number.isFinite(landmark.line) || !Number.isFinite(landmark.top)) continue;
+        if (landmark.top <= scrollTop) {
+            before = landmark;
+        } else {
+            after = landmark;
+            break;
+        }
+    }
+    if (before && after) {
+        const span = after.top - before.top;
+        if (span > 0) {
+            const progress = Math.max(0, Math.min(1, (scrollTop - before.top) / span));
+            return before.line + progress * (after.line - before.line);
+        }
+        return before.line;
+    }
+    if (before) return before.line;
+    if (after) return after.line;
+    return fallback;
+}
+
 export function mapPreviewToEditor(scrollTop, previewScrollable, editorScrollable, landmarks = []) {
     if (editorScrollable <= 0 || previewScrollable <= 0) return 0;
     const anchors = [{ editorPct: 0, previewTop: 0 }];

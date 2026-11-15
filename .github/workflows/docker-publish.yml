@@ -20,7 +20,7 @@ env:
   # O namespace da imagem PRECISA ser o mesmo da conta dona do DOCKERHUB_TOKEN.
   # Usar o secret evita o erro "insufficient_scope" causado por publicar em um
   # namespace diferente do usuário autenticado (ex.: giovoni x giovbon).
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/tektite
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/invariante
 
 jobs:
   build-and-push:
@@ -46,7 +46,7 @@ jobs:
           # Pede um token com escopo de push e confere o que o Docker Hub concedeu.
           # Token somente leitura gera exatamente o erro "insufficient_scope".
           if ! token_json=$(curl -fsS -u "${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}" \
-            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${DOCKERHUB_USERNAME}/tektite:push,pull"); then
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE_NAME}:push,pull"); then
             echo "::error::Falha ao autenticar no Docker Hub. Verifique DOCKERHUB_USERNAME e DOCKERHUB_TOKEN."
             exit 1
           fi
