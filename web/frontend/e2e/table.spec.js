@@ -4,8 +4,9 @@ import { createNote, uniqueTitle } from './helpers.js';
 test.describe('Tabulator table mode', () => {
     test('tree expansion shows attachments with open/download actions', async ({ page, request }) => {
         const folder = uniqueTitle('AnexosTable');
+        const title = uniqueTitle('Nota com anexos');
         const note = await createNote(request, {
-            title: uniqueTitle('Nota com anexos'),
+            title,
             folder,
             content: 'Esta nota tem anexos.'
         });
@@ -22,7 +23,7 @@ test.describe('Tabulator table mode', () => {
         await page.locator('.mode-button[data-mode="table"]').click();
         await page.waitForSelector('.tabulator-row.is-note-row', { timeout: 10000 });
 
-        const noteRow = page.locator('.tabulator-row.is-note-row', { hasText: 'Nota com anexos' });
+        const noteRow = page.locator('.tabulator-row.is-note-row', { hasText: title });
         await expect(noteRow).toBeVisible();
 
         const expandButton = noteRow.locator('.tabulator-data-tree-control');
@@ -71,6 +72,107 @@ test.describe('Tabulator table mode', () => {
         await expect(statusColumn).toBeVisible();
         expect(await page.evaluate(() => JSON.parse(localStorage.getItem('tableHiddenProperties'))))
             .toEqual([]);
+    });
+
+    test('edits tags and frontmatter properties directly in the table', async ({ page, request }) => {
+        const folder = uniqueTitle('EdicaoTable');
+        const title = uniqueTitle('Nota editável');
+        const note = await createNote(request, {
+            title,
+            folder,
+            tags: ['inicial'],
+            content: '---\nstatus: ativo\n---\n\nConteúdo.'
+        });
+
+        await page.goto('/');
+        await page.locator(`[data-folder="${folder}"]`).click();
+        await page.locator('.mode-button[data-mode="table"]').click();
+        await page.waitForSelector('.tabulator-row.is-note-row', { timeout: 10000 });
+
+        const row = page.locator('.tabulator-row.is-note-row', { hasText: title }).first();
+        await expect(row).toBeVisible();
+
+        const tagsCell = row.locator('.tabulator-cell[tabulator-field="tags"]');
+        await expect(tagsCell).toContainText('inicial');
+
+        await tagsCell.dblclick();
+        const tagsEditor = page.locator('.table-cell-editor');
+        await expect(tagsEditor).toBeVisible();
+        await tagsEditor.fill('task, oasis');
+        const tagsSaved = page.waitForResponse(response =>
+            response.url().endsWith(`/api/notes/${note.id}`) &&
+            response.request().method() === 'PUT'
+        );
+        await tagsEditor.press('Enter');
+        await tagsSaved;
+
+        await expect(tagsCell).toContainText('task');
+        await expect(tagsCell).toContainText('oasis');
+
+        let saved = await (await request.get(`/api/notes/${note.id}`)).json();
+        expect(saved.content).toContain('tags:');
+        expect(saved.content).toContain('task');
+        expect(saved.content).toContain('oasis');
+        expect(saved.tags).toEqual(expect.arrayContaining(['task', 'oasis']));
+
+        // Removing a tag rewrites the frontmatter list.
+        await tagsCell.dblclick();
+        await page.locator('.table-cell-editor').fill('task');
+        const tagsRemoved = page.waitForResponse(response =>
+            response.url().endsWith(`/api/notes/${note.id}`) &&
+            response.request().method() === 'PUT'
+        );
+        await page.locator('.table-cell-editor').press('Enter');
+        await tagsRemoved;
+
+        saved = await (await request.get(`/api/notes/${note.id}`)).json();
+        expect(saved.tags).toEqual(['task']);
+
+        const statusCell = row.locator('.tabulator-cell[tabulator-field="property:status"]');
+        await expect(statusCell).toContainText('ativo');
+        await statusCell.dblclick();
+        await page.locator('.table-cell-editor').fill('concluido');
+        const statusSaved = page.waitForResponse(response =>
+            response.url().endsWith(`/api/notes/${note.id}`) &&
+            response.request().method() === 'PUT'
+        );
+        await page.locator('.table-cell-editor').press('Enter');
+        await statusSaved;
+
+        await expect(statusCell).toContainText('concluido');
+        saved = await (await request.get(`/api/notes/${note.id}`)).json();
+        expect(saved.content).toContain('status: concluido');
+    });
+
+    test('editing a frontmatter property preserves tags stored only in the database', async ({ page, request }) => {
+        const folder = uniqueTitle('TagsPreservadas');
+        const title = uniqueTitle('Nota com tag no banco');
+        const note = await createNote(request, {
+            title,
+            folder,
+            tags: ['preservada'],
+            content: '---\nstatus: ativo\n---\n\nConteúdo.'
+        });
+
+        await page.goto('/');
+        await page.locator(`[data-folder="${folder}"]`).click();
+        await page.locator('.mode-button[data-mode="table"]').click();
+        await page.waitForSelector('.tabulator-row.is-note-row', { timeout: 10000 });
+
+        const row = page.locator('.tabulator-row.is-note-row', { hasText: title }).first();
+        const statusCell = row.locator('.tabulator-cell[tabulator-field="property:status"]');
+        await statusCell.dblclick();
+        await page.locator('.table-cell-editor').fill('concluido');
+        const saved = page.waitForResponse(response =>
+            response.url().endsWith(`/api/notes/${note.id}`) &&
+            response.request().method() === 'PUT'
+        );
+        await page.locator('.table-cell-editor').press('Enter');
+        await saved;
+
+        const updated = await (await request.get(`/api/notes/${note.id}`)).json();
+        expect(updated.content).toContain('status: concluido');
+        expect(updated.tags).toEqual(['preservada']);
     });
 
     test('shows the column picker even without frontmatter properties', async ({ page, request }) => {

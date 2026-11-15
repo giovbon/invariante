@@ -964,7 +964,10 @@ func TestBackupRoundTripRestoresNotesAndAttachments(t *testing.T) {
 	for _, file := range reader.File {
 		entries[file.Name] = true
 	}
-	if !entries["manifest.json"] || !entries[backupAttachmentPath(targetID, attachmentStorageName)] {
+	expectedNote := fmt.Sprintf("notes/Notes/%d - Target.md", targetID)
+	expectedAttachment := fmt.Sprintf("attachments/%d - Target/%s", targetID, attachmentStorageName)
+	expectedRootNote := fmt.Sprintf("notes/Notes/%d - Source.md", sourceID)
+	if !entries["manifest.json"] || !entries[expectedNote] || !entries[expectedRootNote] || !entries[expectedAttachment] {
 		t.Fatalf("backup is missing expected entries: %#v", entries)
 	}
 	hasNoteFile := false
@@ -1130,6 +1133,63 @@ func TestBackupRejectsUnsafeAttachmentPaths(t *testing.T) {
 	if page, err := app.ListNotes("", "", 10, 0); err != nil || page.Total != 1 ||
 		page.Items[0].Title != "Keep" {
 		t.Fatalf("unsafe restore damaged the library: %#v err=%v", page, err)
+	}
+}
+
+func TestBackupRestoresLegacyAttachmentLayout(t *testing.T) {
+	app, err := NewApp(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	// Archives produced before archive_path existed stored attachments under
+	// attachments/<note ID>/<storage name>. Restore must still read them.
+	manifest := backupManifest{
+		Format: backupFormat, Version: backupVersion,
+		Notes: []backupNote{{ID: 1, Title: "Legacy", Folder: "Pasta", Version: 1}},
+		Attachments: []backupAttachment{{
+			ID: 7, NoteID: 1, Filename: "legacy.txt", StorageName: "legacy.bin",
+			MediaType: "text/plain", Size: int64(len("abc")),
+		}},
+	}
+	var archive bytes.Buffer
+	writer := zip.NewWriter(&archive)
+	entry, err := writer.CreateHeader(&zip.FileHeader{Name: "manifest.json", Method: zip.Deflate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(entry).Encode(manifest); err != nil {
+		t.Fatal(err)
+	}
+	file, err := writer.Create("attachments/1/legacy.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	notes, attachments, err := app.RestoreBackup(archive.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notes != 1 || attachments != 1 {
+		t.Fatalf("unexpected restore counts: notes=%d attachments=%d", notes, attachments)
+	}
+	_, restoredPath, err := app.GetAttachment(1, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(restoredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "abc" {
+		t.Fatalf("restored legacy attachment content = %q", content)
 	}
 }
 

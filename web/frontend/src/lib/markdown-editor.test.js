@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, indentSelection, MarkdownEditor, parseFrontmatter, stripFrontmatter } from './markdown-editor.js';
+import { ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, indentSelection, MarkdownEditor, parseFrontmatter, setFrontmatterProperty, stripFrontmatter } from './markdown-editor.js';
 
 function createTextarea(value, start = 0, end = start) {
     return {
@@ -149,6 +149,68 @@ test('adds legacy tags to Markdown frontmatter without a separate tags field', (
 test('preserves existing frontmatter tags', () => {
     const markdown = '---\ntags: [existing]\n---\n\n# Note';
     assert.equal(ensureFrontmatterTags(markdown, ['legacy']), markdown);
+});
+
+test('adds and replaces frontmatter properties without touching the body', () => {
+    const content = '---\nstatus: ativo\n---\n\nCorpo';
+    assert.equal(
+        setFrontmatterProperty(content, 'status', 'arquivado'),
+        '---\nstatus: arquivado\n---\n\nCorpo'
+    );
+    assert.equal(
+        setFrontmatterProperty(content, 'autor', 'Ana'),
+        '---\nstatus: ativo\nautor: Ana\n---\n\nCorpo'
+    );
+    assert.equal(
+        setFrontmatterProperty('# Note\n\nCorpo', 'status', 'ativo'),
+        '---\nstatus: ativo\n---\n\n# Note\n\nCorpo'
+    );
+    assert.equal(
+        setFrontmatterProperty('---\nstatus: ativo\n---\nCorpo', 'situação', 'ok'),
+        '---\nstatus: ativo\nsituação: ok\n---\nCorpo'
+    );
+    assert.equal(
+        setFrontmatterProperty('---\n"meu campo": antigo\n---\nCorpo', 'meu campo', 'novo'),
+        '---\nmeu campo: novo\n---\nCorpo'
+    );
+    assert.equal(
+        setFrontmatterProperty('---\nstatus: ativo\n---\nCorpo', 'prioridade.max', 3),
+        '---\nstatus: ativo\nprioridade.max: 3\n---\nCorpo'
+    );
+});
+
+test('writes frontmatter lists for tags and replaces existing lists', () => {
+    const content = '---\ntags:\n  - antiga\nstatus: ativo\n---\n\nCorpo';
+    assert.equal(
+        setFrontmatterProperty(content, 'tags', ['task', 'oasis']),
+        '---\ntags:\n  - task\n  - oasis\nstatus: ativo\n---\n\nCorpo'
+    );
+    assert.equal(
+        setFrontmatterProperty('---\ntags: [antiga]\n---\nCorpo', 'tags', ['task']),
+        '---\ntags: task\n---\nCorpo'
+    );
+});
+
+test('removes frontmatter properties and empty frontmatter blocks', () => {
+    assert.equal(
+        setFrontmatterProperty('---\nstatus: ativo\nautor: Ana\n---\n\nCorpo', 'status', null),
+        '---\nautor: Ana\n---\n\nCorpo'
+    );
+    assert.equal(
+        setFrontmatterProperty('---\nstatus: ativo\n---\n\nCorpo', 'status', null),
+        'Corpo'
+    );
+    assert.equal(
+        setFrontmatterProperty('---\nstatus: ativo\n---\n\nCorpo', 'tags', []),
+        '---\nstatus: ativo\n---\n\nCorpo'
+    );
+});
+
+test('quotes frontmatter scalars that need escaping', () => {
+    assert.equal(
+        setFrontmatterProperty('---\nstatus: ativo\n---\nCorpo', 'status', 'em revisão'),
+        '---\nstatus: "em revisão"\n---\nCorpo'
+    );
 });
 
 test('omits metadata frontmatter from the rendered Markdown body', () => {

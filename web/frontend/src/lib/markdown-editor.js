@@ -425,6 +425,77 @@ export function ensureFrontmatterTags(content, tags) {
     return [...frontmatter, ...lines].join('\n');
 }
 
+const frontmatterPropertyName = /^[\p{L}\p{N}_][\p{L}\p{N}_.\/ -]*$/u;
+
+function escapeFrontmatterKey(key) {
+    return key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function formatFrontmatterScalar(value) {
+    if (typeof value === 'boolean') return value ? 'true' : 'false';
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    if (value && typeof value === 'object') return JSON.stringify(value);
+    const text = String(value ?? '');
+    if (text !== '' && /^[\p{L}\p{N}_.\/-]+$/u.test(text)) return text;
+    return JSON.stringify(text);
+}
+
+function frontmatterPropertyLines(key, value) {
+    if (value === null || value === undefined) return [];
+    if (Array.isArray(value)) {
+        const items = value.filter(item =>
+            item !== null && item !== undefined && String(item).trim() !== '');
+        if (items.length === 0) return [];
+        if (items.length === 1) return [`${key}: ${formatFrontmatterScalar(items[0])}`];
+        return [`${key}:`, ...items.map(item => `  - ${formatFrontmatterScalar(item)}`)];
+    }
+    if (typeof value === 'string' && value.trim() === '') return [];
+    return [`${key}: ${formatFrontmatterScalar(value)}`];
+}
+
+function findFrontmatterBounds(lines) {
+    if (lines[0]?.trim() !== '---') return null;
+    const end = lines.findIndex((line, index) =>
+        index > 0 && ['---', '...'].includes(line.trim()));
+    return end > 0 ? { start: 1, end } : null;
+}
+
+export function setFrontmatterProperty(content, key, value) {
+    if (!frontmatterPropertyName.test(key)) {
+        throw new Error('invalid frontmatter property name');
+    }
+    const lines = content.split('\n');
+    const bounds = findFrontmatterBounds(lines);
+    const propertyLines = frontmatterPropertyLines(key, value);
+    if (!bounds) {
+        if (propertyLines.length === 0) return content;
+        return ['---', ...propertyLines, '---', '', ...lines].join('\n');
+    }
+
+    const propertyPattern = new RegExp(`^(?:"${escapeFrontmatterKey(key)}"|'${escapeFrontmatterKey(key)}'|${escapeFrontmatterKey(key)})\\s*:`);
+    const propertyIndex = lines.findIndex((line, index) =>
+        index >= bounds.start && index < bounds.end && propertyPattern.test(line));
+    if (propertyIndex >= 0) {
+        let removeEnd = propertyIndex + 1;
+        while (removeEnd < bounds.end &&
+            (lines[removeEnd].trim() === '' || /^\s/.test(lines[removeEnd]))) {
+            removeEnd++;
+        }
+        lines.splice(propertyIndex, removeEnd - propertyIndex, ...propertyLines);
+    } else if (propertyLines.length) {
+        lines.splice(bounds.end, 0, ...propertyLines);
+    }
+
+    const updated = findFrontmatterBounds(lines);
+    if (updated && !lines.slice(updated.start, updated.end).some(line => line.trim() !== '')) {
+        // Removing the last property should not leave an empty "---" block.
+        let removeCount = updated.end - updated.start + 2;
+        if (lines[updated.end + 1]?.trim() === '') removeCount++;
+        lines.splice(updated.start - 1, removeCount);
+    }
+    return lines.join('\n');
+}
+
 export function stripFrontmatter(content) {
     const lines = content.split('\n');
     if (lines[0]?.trim() !== '---') return content;

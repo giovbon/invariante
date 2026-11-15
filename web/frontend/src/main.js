@@ -1,6 +1,6 @@
 import { requestJSON, requestJSONResponse } from './lib/api-client.js';
 import { CommandPalette } from './lib/command-palette.js';
-import { ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, MarkdownEditor, parseFrontmatter, stripFrontmatter, DEFAULT_TASK_MARKERS } from './lib/markdown-editor.js';
+import { ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, MarkdownEditor, parseFrontmatter, setFrontmatterProperty, stripFrontmatter, DEFAULT_TASK_MARKERS } from './lib/markdown-editor.js';
 import { GraphView } from './lib/graph-view.js';
 import { iconElement, iconHTML } from './lib/icons.js';
 import { findLinkOccurrence, linkTargetMatches, normalizeLinkPath } from './lib/note-links.js';
@@ -124,8 +124,7 @@ const elements = {
     saveStatus: document.querySelector('#saveStatus'),
     appMessage: document.querySelector('#appMessage'),
     newNote: document.querySelector('#newNote'),
-    deleteCurrentNote: document.querySelector('#deleteCurrentNote'),
-    backupInput: document.querySelector('#backupInput')
+    deleteCurrentNote: document.querySelector('#deleteCurrentNote')
 };
 
 function syncMarkdownHighlight() {
@@ -302,11 +301,6 @@ function setupEventListeners() {
     document.querySelector('#graphSearch').addEventListener('input', event => graphView.setSearch(event.target.value));
     elements.newNote.addEventListener('click', () => openNewNote());
     document.querySelector('#commandButton').addEventListener('click', () => void commandPalette.open());
-    elements.backupInput.addEventListener('change', () => {
-        const file = elements.backupInput.files?.[0];
-        elements.backupInput.value = '';
-        if (file) void importBackup(file);
-    });
     document.querySelector('#markdownImportInput').addEventListener('change', event => {
         const files = [...event.target.files];
         event.target.value = '';
@@ -846,7 +840,9 @@ function tableHeight() {
 function tablePropertyKeys(notes) {
     const keys = new Set();
     for (const note of notes) {
-        for (const key of Object.keys(note.properties || {})) keys.add(key);
+        for (const key of Object.keys(note.properties || {})) {
+            if (key !== 'tags') keys.add(key);
+        }
     }
     return [...keys].sort((left, right) => left.localeCompare(right, 'pt-BR'));
 }
@@ -941,13 +937,9 @@ function renderTable() {
             properties: note.properties || {},
             __search: []
         };
-        flattenTableSearchValues(note.title, row.__search);
-        flattenTableSearchValues(note.folder, row.__search);
-        flattenTableSearchValues(note.tags, row.__search);
-        for (const value of Object.values(note.properties || {})) flattenTableSearchValues(value, row.__search);
-        for (const attachment of attachments) row.__search.push(...attachment.__search);
         for (const key of propertyKeys) row[tablePropertyField(key)] = row.properties[key] ?? null;
         if (attachments.length) row.children = attachments;
+        fillTableRowSearch(row, note);
         return row;
     });
 
@@ -968,13 +960,22 @@ function renderTable() {
             formatter: tableFolderFormatter,
             sorter: tableTextSorter
         },
+        {
+            title: 'Tags',
+            field: 'tags',
+            minWidth: 170,
+            widthGrow: 1.5,
+            formatter: tablePropertyFormatter,
+            editor: tableCellEditor,
+            sorter: tablePropertySorter
+        },
         ...visiblePropertyKeys.map(key => ({
             title: key,
             field: tablePropertyField(key),
             minWidth: 110,
             widthGrow: 1,
-            headerTooltip: `Propriedade do frontmatter: ${key}`,
             formatter: tablePropertyFormatter,
+            editor: tableCellEditor,
             sorter: tablePropertySorter
         })),
         {
@@ -984,6 +985,17 @@ function renderTable() {
             widthGrow: 1,
             formatter: tableDateFormatter,
             sorter: tableTextSorter
+        },
+        {
+            title: 'Ações',
+            field: 'actions',
+            width: 96,
+            minWidth: 96,
+            hozAlign: 'right',
+            headerHozAlign: 'right',
+            headerSort: false,
+            resizable: false,
+            formatter: tableActionsFormatter
         },
     ];
 
@@ -1005,11 +1017,13 @@ function renderTable() {
         dataTreeFilter: true,
         dataTreeSort: false,
         initialSort: [{ column: 'updated_at', dir: 'desc' }],
+        editTriggerEvent: 'dblclick',
         rowFormatter: row => {
             const kind = row.getData().kind;
             row.getElement().classList.add(kind === 'attachment' ? 'is-attachment-row' : 'is-note-row');
         }
     });
+    state.table.on('cellEdited', handleTableCellEdited);
     applyTableFilter();
 }
 
@@ -1160,6 +1174,229 @@ function tableFolderFormatter(cell) {
     if (!data.folder) label.className = 'table-empty-value';
     wrapper.append(label);
     return wrapper;
+}
+
+function parseTableTags(value) {
+    const source = Array.isArray(value) ? value : String(value ?? '').split(',');
+    const tags = [];
+    const seen = new Set();
+    for (const item of source) {
+        const tag = String(item ?? '').trim();
+        if (!tag) continue;
+        const key = tag.toLocaleLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        tags.push(tag);
+    }
+    return tags;
+}
+
+function parseTablePropertyValue(value, previous) {
+    const text = String(value ?? '').trim();
+    if (!text) return null;
+    if (Array.isArray(previous)) {
+        return text.split(',').map(item => item.trim()).filter(Boolean);
+    }
+    if (typeof previous === 'number') {
+        const parsed = Number(text.replace(',', '.'));
+        return Number.isFinite(parsed) ? parsed : text;
+    }
+    if (typeof previous === 'boolean') {
+        const normalized = normalizeTableSearch(text);
+        if (['sim', 'true', 'verdadeiro', '1'].includes(normalized)) return true;
+        if (['nao', 'false', 'falso', '0'].includes(normalized)) return false;
+        return text;
+    }
+    if (previous && typeof previous === 'object') {
+        try {
+            return JSON.parse(text);
+        } catch {
+            return text;
+        }
+    }
+    return text;
+}
+
+function tableValuesEqual(left, right) {
+    return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
+function fillTableRowSearch(row, note) {
+    const values = [];
+    flattenTableSearchValues(note.title, values);
+    flattenTableSearchValues(note.folder, values);
+    flattenTableSearchValues(note.tags, values);
+    flattenTableSearchValues(note.properties, values);
+    for (const child of row.children || []) {
+        if (Array.isArray(child.__search)) values.push(...child.__search);
+    }
+    row.__search = values;
+}
+
+// Tabulator calls custom editors with the cell, a render hook and the success
+// and cancel callbacks. A single text input keeps the interaction identical
+// for tags and frontmatter properties: commas split list values, an empty
+// value removes the property.
+function tableCellEditor(cell, onRendered, success, cancel) {
+    const field = cell.getField();
+    const value = cell.getValue();
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'table-cell-editor';
+    input.value = field === 'tags'
+        ? parseTableTags(value).join(', ')
+        : tableDisplayValue(value);
+    if (field === 'tags') {
+        input.placeholder = 'tag1, tag2, …';
+        input.title = 'Separe as tags por vírgula';
+    }
+    let finished = false;
+    const finish = apply => {
+        if (finished) return;
+        finished = true;
+        if (apply) success(input.value);
+        else cancel();
+    };
+    input.addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            finish(true);
+        } else if (event.key === 'Escape') {
+            event.preventDefault();
+            finish(false);
+        }
+        event.stopPropagation();
+    });
+    input.addEventListener('blur', () => finish(true));
+    onRendered(() => {
+        input.focus();
+        input.select();
+    });
+    return input;
+}
+
+function findTableNoteRow(noteID) {
+    if (!state.table) return null;
+    return state.table.getRows().find(row => {
+        const data = row.getData();
+        return data.kind === 'note' && data.noteID === noteID;
+    }) || null;
+}
+
+function updateTableNoteCache(noteID, key, value) {
+    const note = state.tableData.find(item => item.id === noteID);
+    if (!note) return null;
+    note.properties = { ...(note.properties || {}) };
+    if (key === 'tags') {
+        note.tags = Array.isArray(value) ? value : parseTableTags(value);
+        if (note.tags.length) note.properties.tags = note.tags;
+        else delete note.properties.tags;
+    } else if (value === null) {
+        delete note.properties[key];
+    } else {
+        note.properties[key] = value;
+    }
+    return note;
+}
+
+function refreshTableNoteRow(noteID) {
+    const note = state.tableData.find(item => item.id === noteID);
+    const row = findTableNoteRow(noteID);
+    if (!note || !row) return;
+    const data = row.getData();
+    const patch = {
+        tags: note.tags || [],
+        updated_at: note.updated_at || data.updated_at || '',
+        properties: note.properties || {}
+    };
+    for (const field of Object.keys(data)) {
+        if (!field.startsWith(tablePropertyPrefix)) continue;
+        const key = field.slice(tablePropertyPrefix.length);
+        patch[field] = note.properties[key] ?? null;
+    }
+    fillTableRowSearch(data, note);
+    patch.__search = data.__search;
+    void row.update(patch);
+}
+
+function handleTableCellEdited(cell) {
+    const data = cell.getRow().getData();
+    if (data.kind !== 'note') return;
+    const field = cell.getField();
+    const previous = cell.getOldValue();
+    let key;
+    let value;
+    if (field === 'tags') {
+        key = 'tags';
+        value = parseTableTags(cell.getValue());
+        if (tableValuesEqual(value, parseTableTags(previous))) return;
+    } else if (field.startsWith(tablePropertyPrefix)) {
+        key = field.slice(tablePropertyPrefix.length);
+        value = parseTablePropertyValue(cell.getValue(), previous);
+        if (tableValuesEqual(value, previous ?? null)) return;
+    } else {
+        return;
+    }
+    updateTableNoteCache(data.noteID, key, value);
+    refreshTableNoteRow(data.noteID);
+    void queueTablePropertySave(data.noteID, key, value);
+}
+
+// Saves run one after another so editing two cells on the same note never
+// races on the note version (each save reads, rewrites and PUTs the content).
+let tableSaveQueue = Promise.resolve();
+
+function queueTablePropertySave(noteID, key, value) {
+    const job = tableSaveQueue.then(() => persistTableProperty(noteID, key, value));
+    tableSaveQueue = job.catch(() => {});
+    return job;
+}
+
+async function persistTableProperty(noteID, key, value) {
+    try {
+        const note = await requestJSON(`/api/notes/${noteID}`);
+        const content = setFrontmatterProperty(note.content || '', key, value);
+        const payload = {
+            title: note.title,
+            folder: note.folder || '',
+            content,
+            // Preserve tags stored only in the database; validateNote overrides
+            // this with frontmatter tags when the content declares them.
+            tags: Array.isArray(note.tags) ? note.tags : [],
+            version: note.version
+        };
+        if (key === 'tags') {
+            payload.tags = Array.isArray(value) ? value : parseTableTags(value);
+        }
+        const saved = await requestJSON(`/api/notes/${noteID}`, {
+            method: 'PUT',
+            body: JSON.stringify(payload)
+        });
+        const cached = state.tableData.find(item => item.id === noteID);
+        if (cached) {
+            cached.tags = Array.isArray(saved.tags) ? saved.tags : [];
+            cached.updated_at = saved.updated_at || cached.updated_at;
+            cached.properties = { ...(cached.properties || {}) };
+            if (key === 'tags') {
+                if (cached.tags.length) cached.properties.tags = cached.tags;
+                else delete cached.properties.tags;
+            }
+            refreshTableNoteRow(noteID);
+        }
+        if (elements.searchInput.value.trim()) applyTableFilter();
+        else updateTableSummary();
+        if (key === 'tags') void loadTags();
+    } catch (error) {
+        const conflict = error.status === 409;
+        showMessage(
+            conflict
+                ? 'A nota foi alterada em outra aba. A tabela foi recarregada com a versão mais recente.'
+                : `Não foi possível salvar a alteração: ${error.message}`,
+            'error'
+        );
+        invalidateTable();
+        if (state.mode === 'table') void loadTable();
+    }
 }
 
 function tablePropertyFormatter(cell) {
@@ -1672,41 +1909,6 @@ async function exportBackup(button = document.querySelector('#exportBackup')) {
         showMessage('Backup exportado.', 'success');
     } catch (error) {
         showMessage(`Não foi possível exportar o backup: ${error.message}`, 'error');
-    } finally {
-        if (button) button.disabled = false;
-    }
-}
-
-async function importBackup(file, button = document.querySelector('#importBackup')) {
-    if (!window.confirm(
-        'Restaurar este backup substitui TODAS as notas, pastas, tags e anexos atuais.\n\n' +
-        'Essa ação não pode ser desfeita. Deseja continuar?'
-    )) return;
-    if (button) button.disabled = true;
-    try {
-        window.clearTimeout(state.saveTimer);
-        if (state.savePromise) await state.savePromise;
-        const response = await fetch('/api/backup', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/zip' },
-            body: file
-        });
-        if (response.status === 401) {
-            location.replace('/login.html');
-            return;
-        }
-        if (!response.ok) {
-            throw new Error((await response.text()).trim() || `HTTP ${response.status}`);
-        }
-        const result = await response.json();
-        window.alert(
-            `Backup restaurado: ${result.notes} ${result.notes === 1 ? 'nota' : 'notas'} e ` +
-            `${result.attachments} ${result.attachments === 1 ? 'anexo' : 'anexos'}.\n\n` +
-            'A página será recarregada.'
-        );
-        location.replace('/');
-    } catch (error) {
-        showMessage(`Não foi possível restaurar o backup: ${error.message}`, 'error');
     } finally {
         if (button) button.disabled = false;
     }
@@ -3288,11 +3490,11 @@ function renderSettingsPanel() {
     backupSection.className = 'settings-section';
 
     const heading = document.createElement('h3');
-    heading.textContent = 'Backup e restauração';
+    heading.textContent = 'Backup';
 
     const description = document.createElement('p');
     description.className = 'settings-description';
-    description.textContent = 'Baixe um arquivo .zip com todas as notas em Markdown, pastas, tags e anexos, ou restaure um backup substituindo os dados atuais.';
+    description.textContent = 'Baixe um arquivo .zip com todas as notas em Markdown organizadas na hierarquia de pastas, além das tags e dos anexos de cada nota.';
 
     const actions = document.createElement('div');
     actions.className = 'settings-actions';
@@ -3305,15 +3507,7 @@ function renderSettingsPanel() {
     exportButton.textContent = 'Exportar backup';
     exportButton.addEventListener('click', () => void exportBackup(exportButton));
 
-    const importButton = document.createElement('button');
-    importButton.type = 'button';
-    importButton.id = 'importBackup';
-    importButton.className = 'button';
-    importButton.dataset.variant = 'muted';
-    importButton.textContent = 'Importar backup';
-    importButton.addEventListener('click', () => elements.backupInput.click());
-
-    actions.append(exportButton, importButton);
+    actions.append(exportButton);
     backupSection.append(heading, description, actions);
     container.append(tasksSection, backupSection);
     elements.panelContent.replaceChildren(container);
@@ -4145,12 +4339,6 @@ function renderDirectNotes(folder, root) {
         item.append(more);
         list.append(item);
     }
-    if (!page.items.length) {
-        const empty = document.createElement(root ? 'p' : 'li');
-        empty.className = 'tree-loading';
-        empty.textContent = 'Nenhuma nota nesta pasta';
-        list.append(empty);
-    }
     return list;
 }
 
@@ -4739,13 +4927,6 @@ function buildCommandItems(query) {
             icon: 'download',
             keywords: 'salvar baixar',
             run: () => exportBackup()
-        },
-        {
-            title: 'Importar backup',
-            subtitle: 'Restaurar um arquivo .zip',
-            icon: 'upload',
-            keywords: 'restaurar carregar',
-            run: () => elements.backupInput.click()
         }
     ];
     const normalized = query.toLocaleLowerCase();

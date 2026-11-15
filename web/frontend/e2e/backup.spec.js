@@ -1,13 +1,23 @@
+import { readFileSync } from 'node:fs';
 import { test, expect } from '@playwright/test';
 import { createNote, uniqueTitle } from './helpers.js';
 
-test('exports a backup and restores it through the settings panel', async ({ page, request }) => {
+test('exports notes in the folder hierarchy and attachments per note', async ({ page, request }) => {
+    const folder = uniqueTitle('BackupPasta');
     const title = uniqueTitle('Backup');
-    await createNote(request, { title, content: 'marcador de backup', folder: '' });
+    const note = await createNote(request, { title, content: 'marcador de backup', folder });
+
+    const form = new FormData();
+    form.append('file', new Blob(['anexo de backup'], { type: 'text/plain' }), 'anexo.txt');
+    await request.post(`/api/notes/${note.id}/attachments`, { multipart: form });
 
     await page.goto('/');
     await page.locator('#settingsButton').click();
     await expect(page.locator('#panelTitle')).toHaveText('Configurações');
+
+    await expect(page.locator('#exportBackup')).toBeVisible();
+    await expect(page.locator('#importBackup')).toHaveCount(0);
+    await expect(page.locator('#backupInput')).toHaveCount(0);
 
     const downloadPromise = page.waitForEvent('download');
     await page.locator('#exportBackup').click();
@@ -15,11 +25,10 @@ test('exports a backup and restores it through the settings panel', async ({ pag
     const archivePath = await download.path();
     expect(archivePath).toBeTruthy();
 
-    page.on('dialog', dialog => dialog.accept());
-    await page.locator('#backupInput').setInputFiles(archivePath);
-    await expect(page).toHaveURL(/\/$|\/\?$/);
-    await expect(page.locator('#searchInput')).toBeVisible();
-
-    await page.locator('#searchInput').fill(title);
-    await expect(page.locator('.note-card', { hasText: title })).toBeVisible();
+    // Zip entry names live in the archive headers, so searching the raw file
+    // is enough to assert the exported layout without an unzip dependency.
+    const archive = readFileSync(archivePath);
+    expect(archive.includes(`notes/${folder}/`)).toBe(true);
+    expect(archive.includes(`${note.id} - ${title}.md`)).toBe(true);
+    expect(archive.includes(`attachments/${note.id} - ${title}/`)).toBe(true);
 });

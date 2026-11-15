@@ -59,6 +59,10 @@ type backupAttachment struct {
 	MediaType   string `json:"media_type"`
 	Size        int64  `json:"size"`
 	CreatedAt   string `json:"created_at"`
+	// ArchivePath records where the attachment file lives inside the zip.
+	// Older archives omit it and keep the legacy attachments/<note>/<file>
+	// layout, which restore still understands.
+	ArchivePath string `json:"archive_path,omitempty"`
 }
 
 // ExportBackup writes a logical archive with a manifest and every attachment
@@ -123,6 +127,11 @@ func (a *App) ExportBackup(destination io.Writer) error {
 		return err
 	}
 
+	notesByID := make(map[int64]backupNote, len(manifest.Notes))
+	for _, note := range manifest.Notes {
+		notesByID[note.ID] = note
+	}
+
 	rows, err = a.db.Query(`SELECT id, note_id, filename, storage_name, media_type, size, created_at
 		FROM attachments ORDER BY note_id, id`)
 	if err != nil {
@@ -149,6 +158,7 @@ func (a *App) ExportBackup(destination io.Writer) error {
 			rows.Close()
 			return err
 		}
+		item.ArchivePath = backupAttachmentPath(notesByID[item.NoteID], item.StorageName)
 		manifest.Attachments = append(manifest.Attachments, item)
 		files = append(files, attachmentFile{meta: item, path: filePath})
 	}
@@ -191,7 +201,7 @@ func (a *App) ExportBackup(destination io.Writer) error {
 	}
 	for _, file := range files {
 		header := &zip.FileHeader{
-			Name:     backupAttachmentPath(file.meta.NoteID, file.meta.StorageName),
+			Name:     file.meta.ArchivePath,
 			Method:   zip.Deflate,
 			Modified: time.Now(),
 		}
@@ -216,8 +226,10 @@ func (a *App) ExportBackup(destination io.Writer) error {
 	return archive.Close()
 }
 
-func backupNotePath(note backupNote) string {
-	name := strings.Map(func(r rune) rune {
+// sanitizeBackupSegment turns note titles and folder names into portable zip
+// path segments, removing characters that some file systems reject.
+func sanitizeBackupSegment(name string) string {
+	sanitized := strings.Map(func(r rune) rune {
 		switch r {
 		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
 			return '-'
@@ -226,19 +238,67 @@ func backupNotePath(note backupNote) string {
 			return '-'
 		}
 		return r
-	}, strings.TrimSpace(note.Title))
-	name = strings.Trim(name, " .-")
-	if runes := []rune(name); len(runes) > 80 {
-		name = string(runes[:80])
+	}, strings.TrimSpace(name))
+	sanitized = strings.Trim(sanitized, " .-")
+	if runes := []rune(sanitized); len(runes) > 80 {
+		sanitized = string(runes[:80])
 	}
-	if name == "" {
-		return fmt.Sprintf("notes/%d.md", note.ID)
-	}
-	return fmt.Sprintf("notes/%d - %s.md", note.ID, name)
+	return sanitized
 }
 
-func backupAttachmentPath(noteID int64, storageName string) string {
-	return fmt.Sprintf("attachments/%d/%s", noteID, storageName)
+// backupNotePath keeps notes inside the same folder hierarchy used by the app,
+// so extracting the archive reproduces the folder tree.
+func backupNotePath(note backupNote) string {
+	folder := "notes"
+	for _, part := range strings.Split(note.Folder, "/") {
+		if part == "" {
+			continue
+		}
+		segment := sanitizeBackupSegment(part)
+		if segment == "" {
+			segment = "_"
+		}
+		folder = path.Join(folder, segment)
+	}
+	name := fmt.Sprintf("%d.md", note.ID)
+	if title := sanitizeBackupSegment(note.Title); title != "" {
+		name = fmt.Sprintf("%d - %s.md", note.ID, title)
+	}
+	return path.Join(folder, name)
+}
+
+// backupAttachmentPath gives every note its own attachment folder named after
+// the note ID and title, so files from different notes never mix.
+func backupAttachmentPath(note backupNote, storageName string) string {
+	folder := fmt.Sprintf("attachments/%d", note.ID)
+	if title := sanitizeBackupSegment(note.Title); title != "" {
+		folder = fmt.Sprintf("attachments/%d - %s", note.ID, title)
+	}
+	return path.Join(folder, storageName)
+}
+
+// backupAttachmentArchivePath resolves the zip location for an attachment.
+// Archives created before archive_path existed used attachments/<note>/<file>.
+func backupAttachmentArchivePath(attachment backupAttachment) string {
+	if attachment.ArchivePath != "" {
+		return attachment.ArchivePath
+	}
+	return path.Join("attachments", fmt.Sprint(attachment.NoteID), attachment.StorageName)
+}
+
+func validBackupArchivePath(name string) bool {
+	if name == "" || strings.HasPrefix(name, "/") || strings.Contains(name, `\`) {
+		return false
+	}
+	if path.Clean(name) != name || !strings.HasPrefix(name, "attachments/") {
+		return false
+	}
+	for _, part := range strings.Split(name, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // RestoreBackup replaces the whole library with the archive contents. All
@@ -385,7 +445,9 @@ func readBackupArchive(data []byte) (backupManifest, map[string]*zip.File, error
 
 	attachmentIDs := make(map[int64]struct{}, len(manifest.Attachments))
 	storageNames := make(map[string]struct{}, len(manifest.Attachments))
-	for _, attachment := range manifest.Attachments {
+	archivePaths := make(map[string]struct{}, len(manifest.Attachments))
+	for index := range manifest.Attachments {
+		attachment := &manifest.Attachments[index]
 		if attachment.ID < 1 {
 			return backupManifest{}, nil, fmt.Errorf("%w: attachment has an invalid ID", errInvalidBackup)
 		}
@@ -420,7 +482,18 @@ func readBackupArchive(data []byte) (backupManifest, map[string]*zip.File, error
 			return backupManifest{}, nil, fmt.Errorf("%w: attachment %d has an invalid media type",
 				errInvalidBackup, attachment.ID)
 		}
-		entry, exists := files[backupAttachmentPath(attachment.NoteID, attachment.StorageName)]
+		archivePath := backupAttachmentArchivePath(*attachment)
+		if !validBackupArchivePath(archivePath) {
+			return backupManifest{}, nil, fmt.Errorf("%w: attachment %d has an invalid archive path",
+				errInvalidBackup, attachment.ID)
+		}
+		if _, exists := archivePaths[archivePath]; exists {
+			return backupManifest{}, nil, fmt.Errorf("%w: duplicate attachment archive path %q",
+				errInvalidBackup, archivePath)
+		}
+		archivePaths[archivePath] = struct{}{}
+		attachment.ArchivePath = archivePath
+		entry, exists := files[archivePath]
 		if !exists {
 			return backupManifest{}, nil, fmt.Errorf("%w: missing file for attachment %d",
 				errInvalidBackup, attachment.ID)
@@ -454,7 +527,7 @@ func validStorageName(name string) bool {
 
 func writeRestoreFiles(staging string, attachments []backupAttachment, files map[string]*zip.File) error {
 	for _, attachment := range attachments {
-		entry := files[backupAttachmentPath(attachment.NoteID, attachment.StorageName)]
+		entry := files[backupAttachmentArchivePath(attachment)]
 		source, err := entry.Open()
 		if err != nil {
 			return fmt.Errorf("open attachment %d: %w", attachment.ID, err)
