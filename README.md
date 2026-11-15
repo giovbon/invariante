@@ -108,7 +108,7 @@ Para ARM64, compile nativamente no dispositivo ou configure um compilador C cruz
 ## Recursos
 
 - Busca paginada por título ou conteúdo, com FTS5.
-- Árvore de pastas virtual com notas clicáveis dentro de cada pasta; crie notas e pastas pelos ícones ao lado de “Todas as notas”. Os itens são carregados sob demanda em lotes e podem ser movidos por arrastar e soltar.
+- Árvore de pastas virtual com notas clicáveis dentro de cada pasta; crie notas e pastas pelos ícones ao lado de “Todas as notas”. Os itens são carregados sob demanda em lotes e podem ser movidos por arrastar e soltar. `Shift+clique` seleciona um intervalo de notas e `Ctrl/Cmd+clique` alterna notas na seleção; arraste a seleção para mover várias notas juntas ou pressione `Delete` para excluí-las após confirmação.
 - Abrir notas pela árvore ou pelos cards de busca no painel principal, sem janela modal.
 - Criar, editar e excluir notas com salvamento automático no SQLite e restauração da pesquisa ao voltar; notas e pastas podem ser reorganizadas pelo explorador lateral.
 - Anexos enviados pelo editor ficam em `attachments/<id-da-nota>/` no diretório de dados, sem depender do caminho virtual da nota. O editor oferece upload, download e exclusão, insere links Markdown no conteúdo e pode mostrar imagens raster compatíveis no preview. O limite é 25 MiB por arquivo.
@@ -119,6 +119,7 @@ Para ARM64, compile nativamente no dispositivo ou configure um compilador C cruz
 - Mover uma nota ou uma pasta preserva os links baseados em caminho: destinos relativos são recalculados a partir da nova localização e caminhos absolutos (`/Pasta/Nota`) acompanham a pasta movida, tanto nos links de entrada quanto nos de saída. Links por título e trechos de código permanecem inalterados.
 - Editor Markdown próprio, inspirado no fluxo do Basalt, com barra de formatação, atalhos (`Ctrl/Cmd+B`, `I`, `K` e `Ctrl/Cmd+Alt+T` para inserir tabela; `Ctrl/Cmd+Alt+1/2/3` para escolher o modo e `Ctrl/Cmd+Alt+V` para alternar), desfazer/refazer, divisor redimensionável e modos dividido, edição e leitura. O modo edição destaca a sintaxe Markdown e blocos cercados usam Highlight.js (distribuição local, sem dependência de CDN); a leitura também colore o código e mostra o idioma informado na cerca, como ` ```js `.
 - Tags são lidas do frontmatter Markdown (`tags: sei-la`, lista YAML ou lista inline); tags legadas são migradas para o frontmatter quando a nota é aberta para edição. As tags aparecem no topo da lista e nos cards, podem ser clicadas para filtrar as notas e a API expõe a contagem de cada tag.
+- A pesquisa no modo **Tabela** usa Tabulator e mostra colunas fixas (título, pasta, atualização) mais uma coluna para cada propriedade encontrada no frontmatter. O ícone de colunas ao lado da contagem de notas abre a lista de propriedades, onde é possível marcar quais exibir; a escolha fica salva no navegador e a busca continua filtrando por todas as colunas.
 - Duas abas do navegador não sobrescrevem mais uma à outra silenciosamente: o editor envia a versão da nota junto com o salvamento e o servidor responde `409 Conflict` quando outra sessão já alterou o registro.
 - Exportação e restauração de backup completo em um único arquivo `.zip`, com notas, pastas, tags, vínculos e anexos.
 - Interface adaptada para desktop e mobile; tema claro/escuro.

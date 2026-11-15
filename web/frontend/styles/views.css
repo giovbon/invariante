@@ -1192,6 +1192,94 @@
         min-height: 320px;
     }
 
+    .table-columns {
+        position: relative;
+    }
+
+    .table-columns-toggle {
+        position: relative;
+        list-style: none;
+        cursor: pointer;
+    }
+
+    .table-columns-toggle::-webkit-details-marker {
+        display: none;
+    }
+
+    .table-columns.has-hidden-columns .table-columns-toggle::after {
+        position: absolute;
+        top: 3px;
+        right: 3px;
+        width: 6px;
+        height: 6px;
+        border: 1px solid var(--surface);
+        border-radius: 50%;
+        background: var(--accent);
+        content: "";
+    }
+
+    .table-columns-popover {
+        position: absolute;
+        z-index: 40;
+        top: calc(100% + 6px);
+        right: 0;
+        display: flex;
+        width: min(300px, 72vw);
+        max-height: 340px;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        background: var(--surface-raised);
+        box-shadow: var(--shadow-lg);
+    }
+
+    .table-columns-actions {
+        display: flex;
+        gap: 12px;
+        white-space: nowrap;
+    }
+
+    .table-columns-actions .text-button:disabled {
+        opacity: .45;
+        cursor: not-allowed;
+        text-decoration: none;
+    }
+
+    .table-columns-list {
+        display: flex;
+        overflow-y: auto;
+        flex-direction: column;
+        gap: 1px;
+    }
+
+    .table-columns-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 6px;
+        border-radius: var(--radius-sm);
+        color: var(--text);
+        font-size: var(--text-sm);
+        cursor: pointer;
+    }
+
+    .table-columns-item:hover {
+        background: var(--surface-hover);
+    }
+
+    .table-columns-item input {
+        margin: 0;
+        accent-color: var(--accent);
+    }
+
+    .table-columns-empty {
+        margin: 0;
+        color: var(--faint);
+        font-size: var(--text-sm);
+    }
+
     .notes-table {
         position: relative;
         width: 100%;
@@ -1385,7 +1473,18 @@
         height: 15px;
         fill: none;
         stroke: currentColor;
-        stroke-width: 1.6;
+        stroke-width: 1.5;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+    }
+
+    .table-cell-icon.is-note {
+        color: var(--faint);
+    }
+
+    .table-cell-icon.is-note svg {
+        width: 16px;
+        height: 16px;
     }
 
     .table-cell-icon.is-pdf {

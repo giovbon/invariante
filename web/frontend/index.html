@@ -97,7 +97,22 @@
                         <button class="mode-button" type="button" data-mode="content" aria-pressed="false">Conteúdo</button>
                         <button class="mode-button" type="button" data-mode="table" aria-pressed="false">Tabela</button>
                     </div>
-                    <div class="result-count" id="resultCount" aria-live="polite"></div>
+                    <div class="search-toolbar-status">
+                        <details class="table-columns" id="tableColumnPicker" hidden>
+                            <summary class="icon-button table-columns-toggle" title="Colunas do frontmatter" aria-label="Colunas do frontmatter">
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M9.2 4.5v15M14.8 4.5v15"/></svg>
+                            </summary>
+                            <div class="table-columns-popover">
+                                <div class="table-columns-actions">
+                                    <button class="text-button" type="button" id="tableColumnsAll">Mostrar todas</button>
+                                    <button class="text-button" type="button" id="tableColumnsNone">Ocultar todas</button>
+                                </div>
+                                <div class="table-columns-list" id="tableColumnsList"></div>
+                                <p class="table-columns-empty" id="tableColumnsEmpty" hidden>Nenhuma propriedade de frontmatter nas notas exibidas.</p>
+                            </div>
+                        </details>
+                        <div class="result-count" id="resultCount" aria-live="polite"></div>
+                    </div>
                 </div>
                 <div class="tag-filter-bar" id="tagFilterBar" aria-label="Filtrar por tag" hidden></div>
             </section>

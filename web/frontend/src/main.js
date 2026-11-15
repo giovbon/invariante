@@ -2,6 +2,7 @@ import { requestJSON, requestJSONResponse } from './lib/api-client.js';
 import { CommandPalette } from './lib/command-palette.js';
 import { ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, MarkdownEditor, parseFrontmatter, stripFrontmatter, DEFAULT_TASK_MARKERS } from './lib/markdown-editor.js';
 import { GraphView } from './lib/graph-view.js';
+import { iconElement, iconHTML } from './lib/icons.js';
 import { findLinkOccurrence, linkTargetMatches, normalizeLinkPath } from './lib/note-links.js';
 import { highlightCode } from './lib/syntax-highlight.js';
 import { getScrollSpacerHeight, mapEditorToPreview, mapPreviewToEditor } from './lib/scroll-sync.js';
@@ -55,6 +56,9 @@ const state = {
     tableRequestID: 0,
     tableKey: '',
     tableLoaded: false,
+    tableHiddenProperties: new Set(),
+    treeSelection: new Set(),
+    treeSelectionAnchor: null,
     wikilinkRequestID: 0,
     wikilinkTimer: null,
     wikilinkHeadingCache: new Map(),
@@ -82,6 +86,12 @@ const elements = {
     resultsSection: document.querySelector('#resultsSection'),
     tableView: document.querySelector('#tableView'),
     notesTable: document.querySelector('#notesTable'),
+    tableColumnsPicker: document.querySelector('#tableColumnPicker'),
+    tableColumnsToggle: document.querySelector('.table-columns-toggle'),
+    tableColumnsList: document.querySelector('#tableColumnsList'),
+    tableColumnsEmpty: document.querySelector('#tableColumnsEmpty'),
+    tableColumnsAll: document.querySelector('#tableColumnsAll'),
+    tableColumnsNone: document.querySelector('#tableColumnsNone'),
     notesList: document.querySelector('#notesList'),
     resultCount: document.querySelector('#resultCount'),
     resultsTitle: document.querySelector('#resultsTitle'),
@@ -230,6 +240,7 @@ async function initialize() {
     setupEventListeners();
     setupChangeEvents();
     setupTheme();
+    loadTableColumnPreferences();
     const savedPanelWidth = Number(localStorage.getItem('workspacePanelWidth'));
     if (Number.isFinite(savedPanelWidth) && savedPanelWidth > 0) workspacePanelWidth = savedPanelWidth;
     setWorkspacePanelWidth(workspacePanelWidth);
@@ -377,6 +388,24 @@ function setupEventListeners() {
             updateListHistory();
         });
     });
+    elements.tableColumnsList.addEventListener('change', event => {
+        const input = event.target.closest('[data-table-column]');
+        if (!input) return;
+        if (input.checked) state.tableHiddenProperties.delete(input.dataset.tableColumn);
+        else state.tableHiddenProperties.add(input.dataset.tableColumn);
+        saveTableColumnPreferences();
+        renderTable();
+    });
+    elements.tableColumnsAll.addEventListener('click', () => {
+        state.tableHiddenProperties.clear();
+        saveTableColumnPreferences();
+        renderTable();
+    });
+    elements.tableColumnsNone.addEventListener('click', () => {
+        state.tableHiddenProperties = new Set(tablePropertyKeys(state.tableData));
+        saveTableColumnPreferences();
+        renderTable();
+    });
     elements.previousPage.addEventListener('click', () => {
         state.offset = Math.max(0, state.offset - pageSize);
         loadNotes();
@@ -390,6 +419,7 @@ function setupEventListeners() {
         }
     });
     elements.panelContent.addEventListener('click', handlePanelClick);
+    elements.panelContent.addEventListener('keydown', handlePanelKeydown);
     elements.panelContent.addEventListener('dragstart', handleSidebarDragStart);
     elements.panelContent.addEventListener('dragend', clearDropTargets);
     elements.panelContent.addEventListener('dragover', handleSidebarDragOver);
@@ -647,6 +677,7 @@ function updateSearchModes() {
     const tableMode = state.mode === 'table';
     elements.resultsSection.hidden = tableMode;
     elements.tableView.hidden = !tableMode;
+    elements.tableColumnsPicker.hidden = !tableMode;
     elements.searchInput.placeholder = tableMode
         ? 'Pesquisar em qualquer coluna...'
         : 'Pesquisar notas...';
@@ -697,11 +728,11 @@ async function loadNotes() {
 
 const tablePropertyPrefix = 'property:';
 const tableIcons = {
-    note: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h5"/></svg>',
-    file: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 16h6"/></svg>',
+    note: iconHTML('note'),
+    file: iconHTML('file'),
     image: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="m5 17 5-4 3 2.5 3-3 3 3.5"/></svg>',
-    pdf: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h5"/><path d="M9 14h6M9 17h4"/></svg>',
-    folder: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>',
+    pdf: iconHTML('pdf'),
+    folder: iconHTML('folder'),
     open: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>',
     download: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14"/></svg>',
     paperclip: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 12.5 7.1-7.1a3 3 0 0 1 4.2 4.2l-9.2 9.2a5 5 0 0 1-7.1-7.1l9.2-9.2"/></svg>'
@@ -819,6 +850,48 @@ function tablePropertyKeys(notes) {
     return [...keys].sort((left, right) => left.localeCompare(right, 'pt-BR'));
 }
 
+function loadTableColumnPreferences() {
+    try {
+        const stored = JSON.parse(localStorage.getItem('tableHiddenProperties') || '[]');
+        state.tableHiddenProperties = new Set(
+            Array.isArray(stored) ? stored.filter(key => typeof key === 'string') : []
+        );
+    } catch {
+        state.tableHiddenProperties = new Set();
+    }
+}
+
+function saveTableColumnPreferences() {
+    localStorage.setItem('tableHiddenProperties', JSON.stringify([...state.tableHiddenProperties]));
+}
+
+function renderTableColumnsMenu(propertyKeys) {
+    if (!elements.tableColumnsPicker) return;
+    elements.tableColumnsEmpty.hidden = propertyKeys.length > 0;
+    elements.tableColumnsAll.disabled = propertyKeys.length === 0;
+    elements.tableColumnsNone.disabled = propertyKeys.length === 0;
+    elements.tableColumnsList.replaceChildren();
+    const visibleCount = propertyKeys.filter(key => !state.tableHiddenProperties.has(key)).length;
+    const label = propertyKeys.length
+        ? `Colunas do frontmatter (${visibleCount} de ${propertyKeys.length} visíveis)`
+        : 'Colunas do frontmatter';
+    elements.tableColumnsToggle.title = label;
+    elements.tableColumnsToggle.setAttribute('aria-label', label);
+    elements.tableColumnsPicker.classList.toggle('has-hidden-columns', visibleCount < propertyKeys.length);
+    for (const key of propertyKeys) {
+        const label = document.createElement('label');
+        label.className = 'table-columns-item';
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.dataset.tableColumn = key;
+        input.checked = !state.tableHiddenProperties.has(key);
+        const text = document.createElement('span');
+        text.textContent = key;
+        label.append(input, text);
+        elements.tableColumnsList.append(label);
+    }
+}
+
 function tableAttachmentRow(note, attachment) {
     const values = [attachment.filename, attachment.media_type, formatFileSize(attachment.size)];
     return {
@@ -852,6 +925,8 @@ function renderTable() {
     }
 
     const propertyKeys = tablePropertyKeys(state.tableData);
+    const visiblePropertyKeys = propertyKeys.filter(key => !state.tableHiddenProperties.has(key));
+    renderTableColumnsMenu(propertyKeys);
     const rows = state.tableData.map(note => {
         const attachments = (note.attachments || []).map(attachment => tableAttachmentRow(note, attachment));
         const row = {
@@ -892,7 +967,7 @@ function renderTable() {
             formatter: tableFolderFormatter,
             sorter: tableTextSorter
         },
-        ...propertyKeys.map(key => ({
+        ...visiblePropertyKeys.map(key => ({
             title: key,
             field: tablePropertyField(key),
             minWidth: 110,
@@ -995,7 +1070,7 @@ function tableDisplayValue(value) {
 
 function tableNoteIcon() {
     const icon = document.createElement('span');
-    icon.className = 'table-cell-icon';
+    icon.className = 'table-cell-icon is-note';
     icon.innerHTML = tableIcons.note;
     return icon;
 }
@@ -1407,7 +1482,7 @@ function createNoteCard(note, contentSearch, query = '') {
         const folder = document.createElement('span');
         folder.className = 'note-folder';
         folder.title = note.folder;
-        folder.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+        folder.innerHTML = tableIcons.folder;
         const label = document.createElement('span');
         label.textContent = note.folder;
         folder.append(label);
@@ -2073,6 +2148,14 @@ function showEditor(note) {
         ? 'edit'
         : preferredMode);
     updatePreview();
+    // Setting a textarea's value puts the caret at the end in Chromium, and
+    // focusing it then scrolls the editor (and, through scroll sync, the
+    // preview) to the last line. Reset the caret and both panes so long notes
+    // always open at the top.
+    elements.noteContent.setSelectionRange(0, 0);
+    elements.noteContent.scrollTop = 0;
+    elements.noteContentHighlight.scrollTop = 0;
+    elements.markdownPreview.scrollTop = 0;
     elements.noteContent.focus();
     updateEditorBreadcrumb();
     if (note) {
@@ -2545,6 +2628,57 @@ async function deleteNote(id) {
         await loadFolderNotes('', false);
     } catch (error) {
         showMessage(`Não foi possível excluir a nota: ${error.message}`, 'error');
+    }
+}
+
+async function deleteSelectedTreeNotes() {
+    const ids = selectedTreeNoteIDs();
+    if (!ids.length) return;
+    if (ids.length === 1) {
+        await deleteNote(ids[0]);
+        return;
+    }
+    if (!window.confirm(`Excluir ${ids.length} notas? Essa ação não pode ser desfeita.`)) return;
+    const deletingCurrent = state.view === 'editor' && ids.includes(state.noteID);
+    try {
+        if (deletingCurrent) {
+            window.clearTimeout(state.saveTimer);
+            if (state.savePromise) await state.savePromise;
+        }
+        const results = await Promise.allSettled(ids.map(id =>
+            requestJSON(`/api/notes/${id}`, { method: 'DELETE' })
+        ));
+        const deleted = ids.filter((_, index) => results[index].status === 'fulfilled');
+        const failed = ids.length - deleted.length;
+        state.graphData = null;
+        invalidateTable();
+        state.folderNotesGeneration++;
+        state.folderNotes.clear();
+        clearTreeSelection();
+        showMessage(
+            failed
+                ? `${deleted.length} notas excluídas, ${failed} falharam.`
+                : `${deleted.length} notas excluídas.`,
+            failed ? 'error' : 'success'
+        );
+        void loadTasks();
+        if (deletingCurrent) {
+            state.savedDraft = getDraft();
+            state.noteID = null;
+            resetBacklinks();
+            resetOutline();
+            if (state.directEntry) await returnToList(state.listState || captureListState(), true);
+            else history.back();
+            void Promise.all([loadFolders(), loadNotes(), loadTags()]);
+            void loadFolderNotes('', false);
+            return;
+        }
+        state.total = Math.max(0, state.total - deleted.length);
+        if (state.offset > 0 && state.offset >= state.total) state.offset = Math.max(0, state.offset - pageSize);
+        await Promise.all([loadNotes(), loadFolders()]);
+        await loadFolderNotes('', false);
+    } catch (error) {
+        showMessage(`Não foi possível excluir as notas: ${error.message}`, 'error');
     }
 }
 
@@ -3721,6 +3855,54 @@ function scrollToOutlineHeading(line) {
     }
 }
 
+function visibleTreeNoteIDs() {
+    return [...elements.panelContent.querySelectorAll('[data-tree-note]')]
+        .map(button => Number(button.dataset.treeNote));
+}
+
+function selectedTreeNoteIDs() {
+    return visibleTreeNoteIDs().filter(id => state.treeSelection.has(id));
+}
+
+function updateTreeSelection() {
+    elements.panelContent.querySelectorAll('[data-tree-note]').forEach(button => {
+        const selected = state.treeSelection.has(Number(button.dataset.treeNote));
+        button.classList.toggle('is-selected', selected);
+        button.setAttribute('aria-pressed', String(selected));
+    });
+}
+
+function selectTreeNote(noteID, mode = 'single') {
+    if (mode === 'range' && state.treeSelectionAnchor !== null) {
+        const ids = visibleTreeNoteIDs();
+        const anchorIndex = ids.indexOf(state.treeSelectionAnchor);
+        const targetIndex = ids.indexOf(noteID);
+        if (anchorIndex >= 0 && targetIndex >= 0) {
+            const start = Math.min(anchorIndex, targetIndex);
+            const end = Math.max(anchorIndex, targetIndex);
+            state.treeSelection = new Set(ids.slice(start, end + 1));
+            updateTreeSelection();
+            return;
+        }
+    }
+    if (mode === 'toggle') {
+        if (state.treeSelection.has(noteID)) state.treeSelection.delete(noteID);
+        else state.treeSelection.add(noteID);
+        state.treeSelectionAnchor = noteID;
+        updateTreeSelection();
+        return;
+    }
+    state.treeSelection = new Set([noteID]);
+    state.treeSelectionAnchor = noteID;
+    updateTreeSelection();
+}
+
+function clearTreeSelection() {
+    state.treeSelection.clear();
+    state.treeSelectionAnchor = null;
+    updateTreeSelection();
+}
+
 function renderFolderPanel() {
     const scrollTop = elements.panel.scrollTop;
     const rootRow = document.createElement('div');
@@ -3765,6 +3947,7 @@ function renderFolderPanel() {
     for (const folder of state.folders) tree.append(buildFolderNode(folder));
     elements.panelContent.replaceChildren(rootRow, root, tree);
     elements.panel.scrollTop = scrollTop;
+    updateTreeSelection();
 }
 
 function makeExpandButton(folderPath, label) {
@@ -3780,40 +3963,11 @@ function makeExpandButton(folderPath, label) {
 }
 
 function createTreeDocumentIcon(className) {
-    const namespace = 'http://www.w3.org/2000/svg';
-    const icon = document.createElementNS(namespace, 'svg');
-    icon.setAttribute('viewBox', '0 0 24 24');
-    icon.setAttribute('aria-hidden', 'true');
-    icon.classList.add(className);
-    for (const [className, pathData] of [
-        ['tree-document-page', 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'],
-        ['tree-document-fold', 'M14 2v6h6'],
-        ['tree-document-lines', 'M16 13H8m8 4H8m5-8H8']
-    ]) {
-        const path = document.createElementNS(namespace, 'path');
-        path.setAttribute('d', pathData);
-        path.classList.add(className);
-        icon.append(path);
-    }
-    return icon;
+    return iconElement('note', className, 'tree-document');
 }
 
 function createTreeFolderIcon(className) {
-    const namespace = 'http://www.w3.org/2000/svg';
-    const icon = document.createElementNS(namespace, 'svg');
-    icon.setAttribute('viewBox', '0 0 24 24');
-    icon.setAttribute('aria-hidden', 'true');
-    icon.classList.add(className);
-    for (const [className, pathData] of [
-        ['tree-folder-body', 'M3.5 6.5h6l2 2h9v9a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z'],
-        ['tree-folder-tab', 'M3.5 8.5v-2a2 2 0 0 1 2-2h3l2 2']
-    ]) {
-        const path = document.createElementNS(namespace, 'path');
-        path.setAttribute('d', pathData);
-        path.classList.add(className);
-        icon.append(path);
-    }
-    return icon;
+    return iconElement('folder', className, 'tree-folder');
 }
 
 function buildFolderNode(folder) {
@@ -3901,6 +4055,8 @@ function renderDirectNotes(folder, root) {
         button.dataset.dragNote = String(note.id);
         button.draggable = true;
         button.title = note.title;
+        if (state.treeSelection.has(note.id)) button.classList.add('is-selected');
+        button.setAttribute('aria-pressed', String(state.treeSelection.has(note.id)));
         const label = document.createElement('span');
         label.className = 'tree-note-label';
         label.textContent = note.title;
@@ -3942,6 +4098,18 @@ function renderDirectNotes(folder, root) {
         list.append(empty);
     }
     return list;
+}
+
+function handlePanelKeydown(event) {
+    if (isTypingTarget(event.target)) return;
+    if (event.key === 'Escape' && state.treeSelection.size) {
+        event.preventDefault();
+        clearTreeSelection();
+        return;
+    }
+    if ((event.key !== 'Delete' && event.key !== 'Backspace') || !state.treeSelection.size) return;
+    event.preventDefault();
+    void deleteSelectedTreeNotes();
 }
 
 function handlePanelClick(event) {
@@ -4039,12 +4207,25 @@ function handlePanelClick(event) {
     }
     const folderButton = event.target.closest('[data-folder]');
     if (folderButton) {
+        clearTreeSelection();
         void selectFolder(folderButton.dataset.folder);
         return;
     }
     const note = event.target.closest('[data-tree-note]');
     if (note) {
-        void openNote(Number(note.dataset.treeNote));
+        const noteID = Number(note.dataset.treeNote);
+        if (event.shiftKey) {
+            event.preventDefault();
+            selectTreeNote(noteID, 'range');
+            return;
+        }
+        if (event.ctrlKey || event.metaKey) {
+            event.preventDefault();
+            selectTreeNote(noteID, 'toggle');
+            return;
+        }
+        selectTreeNote(noteID);
+        void openNote(noteID);
     }
 }
 
@@ -4053,10 +4234,30 @@ function handleSidebarDragStart(event) {
     const folder = event.target.closest('[data-drag-folder]');
     const source = note || folder;
     if (!source || !event.dataTransfer) return;
-    const type = note ? 'note' : 'folder';
-    const value = note ? note.dataset.dragNote : folder.dataset.dragFolder;
     event.dataTransfer.effectAllowed = 'move';
-    event.dataTransfer.setData(`application/x-pkm-${type}`, value);
+    if (note) {
+        const noteID = Number(note.dataset.dragNote);
+        // Dragging a note that is not part of the current selection starts a
+        // fresh single-note selection, like a file explorer.
+        if (!state.treeSelection.has(noteID) || state.treeSelection.size === 1) {
+            selectTreeNote(noteID);
+        }
+        const noteIDs = selectedTreeNoteIDs();
+        if (noteIDs.length > 1) {
+            event.dataTransfer.setData('application/x-pkm-notes', JSON.stringify(noteIDs));
+            event.dataTransfer.setData('text/plain', `${noteIDs.length} notas`);
+            for (const button of elements.panelContent.querySelectorAll('[data-drag-note]')) {
+                if (state.treeSelection.has(Number(button.dataset.dragNote))) {
+                    button.classList.add('is-dragging');
+                }
+            }
+            return;
+        }
+        event.dataTransfer.setData('application/x-pkm-note', String(noteID));
+        source.classList.add('is-dragging');
+        return;
+    }
+    event.dataTransfer.setData('application/x-pkm-folder', folder.dataset.dragFolder);
     source.classList.add('is-dragging');
 }
 
@@ -4084,10 +4285,20 @@ async function handleSidebarDrop(event) {
     if (!target || !event.dataTransfer) return;
     event.preventDefault();
     const destinationParent = target.dataset.dropFolder;
+    const notesPayload = event.dataTransfer.getData('application/x-pkm-notes');
     const noteID = event.dataTransfer.getData('application/x-pkm-note');
     const sourceFolder = event.dataTransfer.getData('application/x-pkm-folder');
     clearDropTargets();
-    if (noteID) {
+    if (notesPayload) {
+        let noteIDs = [];
+        try {
+            const parsed = JSON.parse(notesPayload);
+            if (Array.isArray(parsed)) noteIDs = parsed.filter(id => Number.isInteger(id));
+        } catch {
+            noteIDs = [];
+        }
+        if (noteIDs.length) await moveNotesToFolder(noteIDs, destinationParent);
+    } else if (noteID) {
         await moveNoteToFolder(Number(noteID), destinationParent);
     } else if (sourceFolder) {
         await moveFolderToParent(sourceFolder, destinationParent);
@@ -4110,10 +4321,44 @@ async function moveNoteToFolder(noteID, folder) {
         }
         await refreshOpenNoteAfterMove();
         showMessage('Nota movida.', 'success');
+        clearTreeSelection();
         await refreshFolderTree();
         await loadNotes();
     } catch (error) {
         showMessage(`Não foi possível mover a nota: ${error.message}`, 'error');
+    }
+}
+
+async function moveNotesToFolder(noteIDs, folder) {
+    const ids = [...new Set(noteIDs)].filter(id => Number.isInteger(id));
+    if (!ids.length) return;
+    if (ids.length === 1) {
+        await moveNoteToFolder(ids[0], folder);
+        return;
+    }
+    try {
+        if (state.view === 'editor' && !(await flushSave())) return;
+        const results = await Promise.allSettled(ids.map(id => requestJSON(`/api/notes/${id}/folder`, {
+            method: 'PATCH',
+            body: JSON.stringify({ folder })
+        })));
+        const moved = ids.filter((_, index) => results[index].status === 'fulfilled');
+        const failed = ids.length - moved.length;
+        state.graphData = null;
+        invalidateTable();
+        if (state.view === 'editor' && moved.includes(state.noteID)) {
+            state.noteFolder = folder;
+            state.savedDraft = getDraft();
+            updateEditorBreadcrumb();
+        }
+        await refreshOpenNoteAfterMove();
+        const message = moved.length === 1 ? 'Nota movida.' : `${moved.length} notas movidas.`;
+        showMessage(failed ? `${message} ${failed} falharam.` : message, failed ? 'error' : 'success');
+        clearTreeSelection();
+        await refreshFolderTree();
+        await loadNotes();
+    } catch (error) {
+        showMessage(`Não foi possível mover as notas: ${error.message}`, 'error');
     }
 }
 

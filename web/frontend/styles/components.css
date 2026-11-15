@@ -982,6 +982,19 @@
         background: transparent;
     }
 
+    .tree-note.is-selected {
+        color: var(--accent);
+        background: var(--accent-soft);
+    }
+
+    .tree-note.is-selected .tree-note-icon {
+        stroke: var(--accent);
+    }
+
+    .tree-note-item:has(.tree-note.is-selected) .tree-note-actions {
+        background: var(--accent-soft);
+    }
+
     .tree-note-delete,
     .tree-folder-delete {
         color: var(--danger);
@@ -1343,6 +1356,12 @@
         display: flex;
         align-items: center;
         gap: 4px;
+    }
+
+    .search-toolbar-status {
+        display: flex;
+        align-items: center;
+        gap: 10px;
     }
 
     .mode-button,

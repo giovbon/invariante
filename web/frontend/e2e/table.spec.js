@@ -41,6 +41,57 @@ test.describe('Tabulator table mode', () => {
         await expect(attachmentRows.nth(0).locator('.table-action[title="Baixar anexo"]')).toBeVisible();
     });
 
+    test('allows hiding frontmatter columns', async ({ page, request }) => {
+        const folder = uniqueTitle('ColunasTable');
+        await createNote(request, {
+            title: uniqueTitle('Nota com propriedades'),
+            folder,
+            content: '---\nstatus: ativo\nautor: Ana\n---\n\nConteúdo.'
+        });
+
+        await page.goto('/');
+        await page.locator(`[data-folder="${folder}"]`).click();
+        await page.locator('.mode-button[data-mode="table"]').click();
+        await page.waitForSelector('.tabulator-row.is-note-row', { timeout: 10000 });
+
+        const statusColumn = page.locator('.tabulator-col-title', { hasText: /^status$/ });
+        await expect(statusColumn).toBeVisible();
+
+        await page.locator('.table-columns-toggle').click();
+        const statusToggle = page.locator('#tableColumnsList input[data-table-column="status"]');
+        await expect(statusToggle).toBeChecked();
+        await statusToggle.uncheck();
+
+        await expect(statusColumn).toHaveCount(0);
+        await expect(page.locator('.tabulator-col-title', { hasText: /^autor$/ })).toBeVisible();
+        expect(await page.evaluate(() => JSON.parse(localStorage.getItem('tableHiddenProperties'))))
+            .toEqual(['status']);
+
+        await page.locator('#tableColumnsAll').click();
+        await expect(statusColumn).toBeVisible();
+        expect(await page.evaluate(() => JSON.parse(localStorage.getItem('tableHiddenProperties'))))
+            .toEqual([]);
+    });
+
+    test('shows the column picker even without frontmatter properties', async ({ page, request }) => {
+        const folder = uniqueTitle('SemFrontmatter');
+        await createNote(request, {
+            title: uniqueTitle('Nota simples'),
+            folder,
+            content: 'Sem metadados no frontmatter.'
+        });
+
+        await page.goto('/');
+        await page.locator(`[data-folder="${folder}"]`).click();
+        await page.locator('.mode-button[data-mode="table"]').click();
+        await page.waitForSelector('.tabulator-row.is-note-row', { timeout: 10000 });
+
+        await expect(page.locator('.table-columns-toggle')).toBeVisible();
+        await page.locator('.table-columns-toggle').click();
+        await expect(page.locator('#tableColumnsEmpty')).toBeVisible();
+        await expect(page.locator('#tableColumnsAll')).toBeDisabled();
+    });
+
     test('shows table with note rows', async ({ page, request }) => {
         const folder = uniqueTitle('ProjetosTable');
         await createNote(request, {

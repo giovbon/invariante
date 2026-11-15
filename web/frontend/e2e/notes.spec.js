@@ -1,5 +1,20 @@
 import { test, expect } from '@playwright/test';
-import { uniqueTitle } from './helpers.js';
+import { createNote, uniqueTitle } from './helpers.js';
+
+test('long notes open scrolled to the top', async ({ page, request }) => {
+    const title = uniqueTitle('Nota longa');
+    const content = Array.from({ length: 250 }, (_, index) => `Linha ${index + 1} com algum texto.`).join('\n');
+    const note = await createNote(request, { title, content });
+
+    await page.goto(`/?note=${note.id}`);
+    await expect(page.locator('#noteTitle')).toHaveValue(title);
+    await expect(page.locator('#noteContent')).toHaveValue(content);
+    // The preview render is debounced; give scroll sync time to settle.
+    await page.waitForTimeout(500);
+
+    expect(await page.locator('#noteContent').evaluate(element => element.scrollTop)).toBe(0);
+    expect(await page.locator('#markdownPreview').evaluate(element => element.scrollTop)).toBe(0);
+});
 
 test('creates a note, autosaves, survives reload and is searchable', async ({ page }) => {
     const title = uniqueTitle('Nota E2E');
