@@ -836,9 +836,13 @@
     .markdown-preview h1,
     .markdown-preview h2,
     .markdown-preview h3,
-    .markdown-preview h4 {
+    .markdown-preview h4,
+    .markdown-preview h5,
+    .markdown-preview h6 {
         margin: .8em 0 .4em;
         line-height: var(--leading-tight);
+        /* Deixa espaço para o cabeçalho fixo ao seguir as âncoras do bloco toc. */
+        scroll-margin-top: 1.2em;
     }
 
     .markdown-preview h1 {
@@ -849,8 +853,47 @@
         font-size: 1.4em;
     }
 
+    .markdown-preview h3 {
+        font-size: 1.2em;
+    }
+
+    .markdown-preview h4 {
+        font-size: 1.08em;
+    }
+
+    .markdown-preview h5,
+    .markdown-preview h6 {
+        font-size: 1em;
+        color: var(--muted);
+    }
+
     .markdown-preview p {
         margin: .55em 0;
+    }
+
+    .markdown-preview table {
+        width: 100%;
+        margin: 12px 0;
+        border-collapse: collapse;
+        font-size: .95em;
+    }
+
+    .markdown-preview th,
+    .markdown-preview td {
+        padding: 6px 10px;
+        border: 1px solid var(--border);
+        text-align: left;
+        vertical-align: top;
+    }
+
+    .markdown-preview thead th {
+        border-color: color-mix(in srgb, var(--border) 70%, var(--text));
+        background: var(--surface-raised);
+        font-weight: 600;
+    }
+
+    .markdown-preview tbody tr:nth-child(even) {
+        background: color-mix(in srgb, var(--surface-hover) 55%, transparent);
     }
 
     .markdown-preview pre,

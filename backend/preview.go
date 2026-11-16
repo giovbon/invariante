@@ -33,6 +33,7 @@ func (a *App) handlePreview(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	ctx := noteBlockContext{}
 	if rawID := r.Header.Get("X-Note-ID"); rawID != "" {
 		noteID, err := strconv.ParseInt(rawID, 10, 64)
 		if err != nil || noteID < 1 {
@@ -51,6 +52,13 @@ func (a *App) handlePreview(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to load note for preview", http.StatusInternalServerError)
 			return
 		}
+		ctx = noteBlockContext{NoteID: noteID, Title: title, Folder: folder}
+	}
+	// Blocos dinâmicos são expandidos antes da conversão de wikilinks para
+	// que o Markdown gerado passe pelo mesmo pipeline do texto da nota.
+	expanded := a.expandNoteBlocks(string(source), ctx)
+	source = []byte(expanded.markdown)
+	if ctx.NoteID > 0 {
 		index, err := a.noteIndex()
 		if err != nil {
 			log.Printf("load note index for preview: %v", err)
@@ -58,20 +66,33 @@ func (a *App) handlePreview(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		source = []byte(convertWikilinksToMarkdown(string(source),
-			indexedNote{GraphNode: GraphNode{ID: noteID, Title: title, Folder: folder}},
+			indexedNote{GraphNode: GraphNode{ID: ctx.NoteID, Title: ctx.Title, Folder: ctx.Folder}},
 			index.byPath, index.byTitle))
 	}
-	renderMarkdownPreview(w, source)
+	renderMarkdownPreviewWithShifts(w, source, expanded.shifts)
 }
 
 var previewMarkdown = goldmark.New(goldmark.WithExtensions(extension.GFM))
 
 func renderMarkdownPreview(w http.ResponseWriter, source []byte) {
+	renderMarkdownPreviewWithShifts(w, source, nil)
+}
+
+// renderMarkdownPreviewWithShifts renders the preview and translates the line
+// numbers of the expanded Markdown back to the editor coordinates used by the
+// scroll sync, the task jumps and the outline.
+func renderMarkdownPreviewWithShifts(w http.ResponseWriter, source []byte, shifts []blockLineShift) {
 	lineStarts := markdownLineStarts(source)
 	document := previewMarkdown.Parser().Parse(text.NewReader(source))
+	slugs := make(map[string]int)
 	if err := ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
 			return ast.WalkContinue, nil
+		}
+		// As âncoras alimentam o índice gerado pelo bloco `toc`; o slug usa a
+		// mesma função, então os links sempre encontram o cabeçalho.
+		if _, isHeading := node.(*ast.Heading); isHeading {
+			node.SetAttributeString("id", []byte(nextHeadingSlug(nodePlainText(node, source), slugs)))
 		}
 		switch link := node.(type) {
 		case *ast.Link:
@@ -89,7 +110,7 @@ func renderMarkdownPreview(w http.ResponseWriter, source []byte) {
 		switch node.Kind() {
 		case ast.KindParagraph, ast.KindListItem, ast.KindBlockquote:
 			if line, ok := previewSourceLine(node, source, lineStarts); ok {
-				node.SetAttributeString("data-source-line", strconv.Itoa(line))
+				node.SetAttributeString("data-source-line", strconv.Itoa(adjustSourceLine(shifts, line)))
 			}
 		}
 		return ast.WalkContinue, nil

@@ -637,12 +637,16 @@ func (a *App) Tags() ([]TagCount, error) {
 }
 
 func (a *App) SearchNotes(query, mode, folder, tag string, limit, offset int) (Page, error) {
-	match, err := makeFTSQuery(query, mode)
+	expressions, err := ftsMatchExpressions(query, mode)
+	if err != nil {
+		return Page{}, err
+	}
+	normalizedMode, err := normalizeSearchMode(mode)
 	if err != nil {
 		return Page{}, err
 	}
 	revision := a.currentDataRevision()
-	cacheKey := fmt.Sprintf("%s\x00%s\x00%s\x00%s|%d|%d", query, mode, folder, tag, limit, offset)
+	cacheKey := fmt.Sprintf("%s\x00%s\x00%s\x00%s|%d|%d", query, normalizedMode, folder, tag, limit, offset)
 	a.cacheMu.Lock()
 	for _, entry := range a.searchCache {
 		if entry.revision == revision && entry.key == cacheKey {
@@ -652,6 +656,22 @@ func (a *App) SearchNotes(query, mode, folder, tag string, limit, offset int) (P
 		}
 	}
 	a.cacheMu.Unlock()
+	// A busca relaxada só entra quando a estrita não encontra nada, então a
+	// precisão do caso comum não muda.
+	for index, match := range expressions {
+		page, err := a.searchNotesWithMatch(match, normalizedMode, folder, tag, limit, offset)
+		if err != nil {
+			return Page{}, err
+		}
+		if page.Total == 0 && index < len(expressions)-1 {
+			continue
+		}
+		return a.cacheSearchPage(revision, cacheKey, page), nil
+	}
+	return a.cacheSearchPage(revision, cacheKey, Page{Limit: limit, Offset: offset}), nil
+}
+
+func (a *App) searchNotesWithMatch(match, mode, folder, tag string, limit, offset int) (Page, error) {
 	var total int
 	if err := a.readDB.QueryRow(`SELECT COUNT(*)
 		FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
@@ -681,7 +701,7 @@ func (a *App) SearchNotes(query, mode, folder, tag string, limit, offset int) (P
 		if err != nil {
 			return Page{}, err
 		}
-		return a.cacheSearchPage(revision, cacheKey, Page{Items: items, Total: total, Limit: limit, Offset: offset}), nil
+		return Page{Items: items, Total: total, Limit: limit, Offset: offset}, nil
 	}
 
 	rows, err := a.readDB.Query(`SELECT n.rowid, n.title, n.folder, substr(COALESCE(n.content, ''), 1, 180), n.updated_at, COALESCE(n.tags, '')
@@ -700,7 +720,7 @@ func (a *App) SearchNotes(query, mode, folder, tag string, limit, offset int) (P
 	if err != nil {
 		return Page{}, err
 	}
-	return a.cacheSearchPage(revision, cacheKey, Page{Items: items, Total: total, Limit: limit, Offset: offset}), nil
+	return Page{Items: items, Total: total, Limit: limit, Offset: offset}, nil
 }
 
 func (a *App) cacheSearchPage(revision uint64, key string, page Page) Page {
@@ -717,21 +737,29 @@ func (a *App) cacheSearchPage(revision uint64, key string, page Page) Page {
 // a single note. The search result card only carries a couple of snippets, so
 // expanding a result asks for the complete list on demand.
 func (a *App) NoteOccurrences(id int64, query string) ([]string, int, error) {
-	match, err := makeFTSQuery(query, "content")
+	expressions, err := ftsMatchExpressions(query, "content")
 	if err != nil {
 		return nil, 0, err
 	}
-	var marked string
-	err = a.readDB.QueryRow(`SELECT highlight(notes_fts, 1, char(30), char(31))
-		FROM notes_fts WHERE rowid = ? AND notes_fts MATCH ?`, id, match).Scan(&marked)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, 0, nil
+	for index, match := range expressions {
+		var marked string
+		err = a.readDB.QueryRow(`SELECT highlight(notes_fts, 1, char(30), char(31))
+			FROM notes_fts WHERE rowid = ? AND notes_fts MATCH ?`, id, match).Scan(&marked)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Mesma ordem de fallback usada na busca: se a expressão estrita não
+			// casa com a nota, a relaxada ainda pode encontrar os trechos.
+			if index < len(expressions)-1 {
+				continue
+			}
+			return nil, 0, nil
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+		occurrences := strings.Count(marked, string(contentMatchStart))
+		return buildContentSnippets(marked, maxOccurrenceSnippets), occurrences, nil
 	}
-	if err != nil {
-		return nil, 0, err
-	}
-	occurrences := strings.Count(marked, string(contentMatchStart))
-	return buildContentSnippets(marked, maxOccurrenceSnippets), occurrences, nil
+	return nil, 0, nil
 }
 
 const (
@@ -865,27 +893,85 @@ func scanSummaries(rows *sql.Rows) ([]NoteSummary, error) {
 	return items, rows.Err()
 }
 
-func makeFTSQuery(query, mode string) (string, error) {
+func normalizeSearchMode(mode string) (string, error) {
 	switch mode {
-	case "":
-		mode = "title"
-	case "title", "content":
+	case "", "title":
+		return "title", nil
+	case "content":
+		return "content", nil
 	default:
 		return "", errors.New("mode must be title or content")
 	}
+}
+
+// ftsMatchExpressions returns the search expressions in priority order. The
+// strict one requires every term; the relaxed one accepts any term and is used
+// when the strict search finds nothing, so a single typo or a different
+// inflection does not hide the note completely.
+func ftsMatchExpressions(query, mode string) ([]string, error) {
+	mode, err := normalizeSearchMode(mode)
+	if err != nil {
+		return nil, err
+	}
 	query = strings.TrimSpace(query)
 	if query == "" || len([]rune(query)) > 256 {
-		return "", errors.New("query must contain between 1 and 256 characters")
+		return nil, errors.New("query must contain between 1 and 256 characters")
 	}
-	terms := strings.FieldsFunc(query, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsNumber(r) })
-	if len(terms) == 0 {
-		return "", errors.New("query must contain searchable characters")
+	parts := ftsQueryParts(query)
+	if len(parts) == 0 {
+		return nil, errors.New("query must contain searchable characters")
 	}
-	quoted := make([]string, 0, len(terms))
-	for _, term := range terms {
-		quoted = append(quoted, `"`+strings.ReplaceAll(term, `"`, `""`)+`"*`)
+	strict := mode + " : (" + strings.Join(parts, " AND ") + ")"
+	if len(parts) == 1 {
+		return []string{strict}, nil
 	}
-	return mode + " : (" + strings.Join(quoted, " AND ") + ")", nil
+	return []string{strict, mode + " : (" + strings.Join(parts, " OR ") + ")"}, nil
+}
+
+// ftsQueryParts turns the typed query into FTS5 terms. Words are matched by
+// prefix ("term"*); text between double quotes becomes an exact phrase.
+func ftsQueryParts(query string) []string {
+	runes := []rune(query)
+	parts := make([]string, 0, 4)
+	seen := make(map[string]struct{}, 4)
+	add := func(part string) {
+		if _, exists := seen[part]; exists {
+			return
+		}
+		seen[part] = struct{}{}
+		parts = append(parts, part)
+	}
+	for index := 0; index < len(runes); {
+		if runes[index] == '"' {
+			index++
+			var phrase strings.Builder
+			for index < len(runes) && runes[index] != '"' {
+				if unicode.IsLetter(runes[index]) || unicode.IsNumber(runes[index]) || unicode.IsSpace(runes[index]) {
+					phrase.WriteRune(runes[index])
+				} else {
+					phrase.WriteRune(' ')
+				}
+				index++
+			}
+			if index < len(runes) {
+				index++
+			}
+			if words := strings.Join(strings.Fields(phrase.String()), " "); words != "" {
+				add(`"` + strings.ReplaceAll(words, `"`, `""`) + `"`)
+			}
+			continue
+		}
+		if unicode.IsLetter(runes[index]) || unicode.IsNumber(runes[index]) {
+			start := index
+			for index < len(runes) && (unicode.IsLetter(runes[index]) || unicode.IsNumber(runes[index])) {
+				index++
+			}
+			add(`"` + string(runes[start:index]) + `"*`)
+			continue
+		}
+		index++
+	}
+	return parts
 }
 
 func (a *App) GetNote(id int64) (Note, error) {

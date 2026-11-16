@@ -707,7 +707,7 @@ func TestMarkdownPreviewRestrictsUnsafeContent(t *testing.T) {
 		t.Fatalf("preview status = %d, body = %s", response.Code, response.Body.String())
 	}
 	rendered := response.Body.String()
-	if !strings.Contains(rendered, "<h1>Heading</h1>") {
+	if !strings.Contains(rendered, `<h1 id="heading">Heading</h1>`) {
 		t.Fatalf("markdown heading was not rendered: %s", rendered)
 	}
 	if strings.Contains(rendered, "<script>") || strings.Contains(rendered, `href="javascript:`) {

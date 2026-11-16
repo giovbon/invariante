@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, indentSelection, isMarkmapNote, MarkdownEditor, noteType, parseFrontmatter, setFrontmatterProperty, stripFrontmatter } from './markdown-editor.js';
+import { formatISODate } from './snippets.js';
 
 function createTextarea(value, start = 0, end = start) {
     return {
@@ -69,6 +70,45 @@ test('Tab indents the whole list item and Shift+Tab outdents it', () => {
     editor.handleKeydown({ key: 'Tab', shiftKey: true, ctrlKey: false, metaKey: false, altKey: false, preventDefault() {} });
     assert.equal(textarea.value, '- item');
     assert.equal(textarea.selectionStart, 6);
+});
+
+test('expands a date snippet while typing and keeps the undo working', () => {
+    const textarea = createTextarea('', 0);
+    const editor = new MarkdownEditor(textarea, () => {});
+    textarea.value = ';hoje';
+    textarea.setSelectionRange(5, 5);
+    editor.handleInput();
+    assert.equal(textarea.value, formatISODate(new Date()));
+    assert.equal(textarea.selectionStart, textarea.value.length);
+});
+
+test('expands the table snippet with the typed dimensions', () => {
+    const textarea = createTextarea('', 0);
+    const changes = [];
+    const editor = new MarkdownEditor(textarea, value => changes.push(value));
+    textarea.value = ';tabela2x3';
+    textarea.setSelectionRange(10, 10);
+    editor.handleInput();
+    assert.equal(textarea.value.split('\n').length, 5);
+    assert.equal(textarea.value.slice(textarea.selectionStart, textarea.selectionEnd), 'Coluna 1');
+    assert.equal(changes.at(-1), textarea.value);
+});
+
+test('Tab expands a pending snippet instead of indenting the line', () => {
+    const textarea = createTextarea('- item ;tabela2x3', 17);
+    const editor = new MarkdownEditor(textarea, () => {});
+    let prevented = false;
+    editor.handleKeydown({ key: 'Tab', shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, preventDefault() { prevented = true; } });
+    assert.equal(prevented, true);
+    assert.ok(textarea.value.startsWith('- item | Coluna 1 | Coluna 2 |'));
+    assert.ok(!textarea.value.startsWith('    - item'));
+});
+
+test('keeps Tab indenting when there is no snippet to expand', () => {
+    const textarea = createTextarea('- item', 6);
+    const editor = new MarkdownEditor(textarea, () => {});
+    editor.handleKeydown({ key: 'Tab', shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, preventDefault() {} });
+    assert.equal(textarea.value, '    - item');
 });
 
 test('formats a selection and supports undo/redo', () => {

@@ -1,4 +1,5 @@
 import { highlightCode } from './syntax-highlight.js';
+import { matchSnippet } from './snippets.js';
 
 function replaceSelection(value, start, end, before, after = before, placeholder = '') {
     const selected = value.slice(start, end) || placeholder;
@@ -90,7 +91,25 @@ export class MarkdownEditor {
         if (!silent) this.onChange(value);
     }
 
+    // Expande atalhos como `;hoje` e `;tabela3x4` no próprio cursor. Retorna
+    // true quando o texto foi alterado; quem chama decide como registrar.
+    expandSnippet(now = new Date()) {
+        const { selectionStart, selectionEnd } = this.textarea;
+        if (selectionStart !== selectionEnd) return false;
+        const match = matchSnippet(this.textarea.value, selectionStart, now);
+        if (!match) return false;
+        const value = this.textarea.value;
+        this.textarea.value = `${value.slice(0, match.start)}${match.text}${value.slice(selectionStart)}`;
+        const caret = match.start + (match.selectStart ?? match.text.length);
+        const caretEnd = match.start + (match.selectEnd ?? match.text.length);
+        this.textarea.setSelectionRange(caret, caretEnd);
+        return true;
+    }
+
     handleInput() {
+        // A expansão acontece antes de registrar o histórico, então o undo
+        // volta para o texto digitado e o preview recebe o valor final.
+        if (this.expandSnippet()) this.lastInputAt = 0;
         const value = this.textarea.value;
         if (this.history[this.historyIndex] !== value) {
             const now = Date.now();
@@ -223,6 +242,14 @@ export class MarkdownEditor {
         }
         if (event.key === 'Tab') {
             event.preventDefault();
+            if (!event.shiftKey && this.expandSnippet()) {
+                this.apply({
+                    value: this.textarea.value,
+                    start: this.textarea.selectionStart,
+                    end: this.textarea.selectionEnd
+                });
+                return;
+            }
             const { selectionStart, selectionEnd } = this.textarea;
             this.apply(indentSelection(this.textarea.value, selectionStart, selectionEnd, event.shiftKey));
             return;

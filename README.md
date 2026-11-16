@@ -134,6 +134,32 @@ Títulos de notas não são únicos. Um wikilink por título (`[[Relatório]]`) 
 
 O servidor envia cabeçalhos de segurança (`Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options` e `Referrer-Policy`), limita o corpo das requisições e registra mutações da API, falhas e requisições lentas no log.
 
+## Atalhos de digitação e blocos dinâmicos
+
+No editor, digitar um atalho no começo de uma palavra expande o texto no cursor (`Tab` expande na hora e `Ctrl/Cmd+Z` desfaz):
+
+| Atalho | Resultado |
+| --- | --- |
+| `;hoje` | data atual em ISO (`2026-11-16`) |
+| `;data` | data atual em `dd/mm/aaaa` |
+| `;hora` | hora e minuto atuais |
+| `;dia` | dia da semana e data |
+| `;amanha` / `;ontem` | datas relativas em ISO |
+| `;tabela3x4` | 3 colunas e 4 linhas de corpo (máximo 12x20); as dimensões são obrigatórias |
+
+O preview interpreta comentários `<!-- ton618:... -->` sozinhos na linha e os substitui por conteúdo gerado a partir do banco. A saída é Markdown, com links que abrem as notas no próprio app:
+
+| Bloco | Argumentos | Conteúdo gerado |
+| --- | --- | --- |
+| `<!-- ton618:tasks -->` | `pasta="Projetos"`, `limite=N` | linhas com marcadores de tarefa |
+| `<!-- ton618:backlinks -->` | `limite=N` | notas que apontam para esta |
+| `<!-- ton618:recentes -->` | `pasta="X"`, `limite=N` | últimas notas alteradas |
+| `<!-- ton618:toc -->` | `nivel=3` | índice dos cabeçalhos da nota |
+| `<!-- ton618:links -->` | `limite=N` | links de saída da nota, com destinos ausentes sinalizados |
+| `<!-- ton618:tabela -->` | `pasta="X"`, `tag="x"`, `colunas="titulo,tags"`, `limite=N` | tabela de notas |
+
+Cada nota aceita até 20 blocos, com até 50 itens cada. Nomes ou argumentos inválidos aparecem como aviso no preview, e `backlinks` e `links` exigem uma nota já salva.
+
 ## Dados, anexos e backup
 
 - As notas, pastas vazias e metadados ficam em `notes.db` no diretório de dados. Os caminhos das pastas associadas às notas também são mantidos nas próprias notas. O índice de busca FTS5 e o índice de vínculos (`note_links`) são mantidos no mesmo banco. O grafo e os backlinks são resolvidos a partir desse índice, sem reler o conteúdo de todas as notas a cada consulta.
@@ -169,6 +195,8 @@ Ao anexar um arquivo pelo editor, uma imagem raster compatível é inserida como
 - `GET /api/health`
 
 Listagens aceitam limites de 1 a 100 registros e filtram por tag exata, sem diferenciar maiúsculas de minúsculas. Títulos aceitam até 256 caracteres, conteúdo até 5 MiB e caminhos de pasta devem ser relativos. Uploads aceitam um arquivo de até 25 MiB; são enviados como `multipart/form-data` usando o campo `file`. Links para anexos são servidos como download; imagens raster podem ser exibidas inline com `?inline=1`.
+
+A busca combina os termos digitados com `AND`, cada palavra valendo como prefixo: `subjuguem a terra` exige as três palavras na nota, em qualquer ordem. Não há stemming, então formas diferentes da mesma palavra (`subjugam` × `subjuguem`) não se encontram. Para exigir a sequência exata, use aspas: `"subjuguem a terra"`. Quando a busca estrita não retorna nada, o servidor repete a consulta aceitando qualquer um dos termos, ordenada por relevância (bm25), para que a nota não desapareça por causa de uma palavra divergente. A busca por título e por conteúdo partilha as mesmas regras.
 
 O endpoint do grafo retorna `{ "nodes": [{ "id", "title", "folder" }], "edges": [{ "source", "target", "type" }] }` e inclui somente notas que participam de pelo menos uma relação. Os tipos de aresta são `markdown` e `wikilink`. Wikilinks aceitam `[[Título]]` e `[[Título|alias]]`; links Markdown locais resolvem caminhos de nota com ou sem extensão `.md`. URLs externas não viram relações entre notas.
 
