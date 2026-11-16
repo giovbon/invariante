@@ -20,3 +20,11 @@ web/frontend/.e2e-data/
 web/frontend/playwright-report/
 web/frontend/test-results/
 .e2e-data/
+
+# Arquivos de desenvolvimento do frontend que não são servidos pela aplicação
+web/frontend/e2e/
+web/frontend/package.json
+web/frontend/package-lock.json
+web/frontend/playwright.config.js
+web/frontend/eslint.config.js
+web/frontend/src/**/*.test.js

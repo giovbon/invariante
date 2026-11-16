@@ -1,5 +1,6 @@
 const svgNS = 'http://www.w3.org/2000/svg';
 const nodeRadius = 14;
+const syncLayoutLimit = 400;
 
 function seededPosition(id, index, width, height, count) {
     let seed = Math.imul(Number(id) || index + 1, 2654435761) >>> 0;
@@ -110,6 +111,15 @@ export class GraphView {
         this.hoveredNodeID = null;
         this.ignoreNextClick = false;
         this.hasRendered = false;
+        this.viewport = null;
+        this.nodeElements = new Map();
+        this.nodeById = new Map();
+        this.edgeRecords = [];
+        this.edgesByNode = new Map();
+        this.worker = null;
+        this.workerFailed = false;
+        this.layoutRequestID = 0;
+        this.fitAfterLayout = false;
         this.resizeTimer = 0;
         this.handleWindowResize = () => {
             window.clearTimeout(this.resizeTimer);
@@ -169,19 +179,23 @@ export class GraphView {
 
     setSearch(search) {
         this.search = search.trim().toLocaleLowerCase();
-        this.render();
+        // The structure does not change while filtering; only classes do.
+        this.applyHighlights();
     }
 
     resize() {
         const bounds = this.svg.getBoundingClientRect();
         if (bounds.width < 1 || bounds.height < 1) return;
-        this.layout = layoutGraph(this.graph.nodes, this.graph.edges, bounds.width, bounds.height);
+        this.layout = null;
         this.transform = { x: 0, y: 0, scale: 1 };
         this.render();
     }
 
     fit() {
-        if (!this.layout || this.layout.nodes.length === 0) return;
+        if (!this.layout || this.layout.nodes.length === 0) {
+            this.fitAfterLayout = true;
+            return;
+        }
         const xs = this.layout.nodes.map(node => node.x);
         const ys = this.layout.nodes.map(node => node.y);
         const minX = Math.min(...xs) - 100;
@@ -196,15 +210,111 @@ export class GraphView {
             y: height / 2 - ((minY + maxY) / 2) * scale,
             scale
         };
-        this.render();
+        this.applyTransform();
     }
 
     render() {
         const bounds = this.svg.getBoundingClientRect();
         if (bounds.width < 1 || bounds.height < 1) return;
-        if (!this.layout || this.layout.nodes.length !== this.graph.nodes.length) {
-            this.layout = layoutGraph(this.graph.nodes, this.graph.edges, bounds.width, bounds.height);
+        const needsLayout = !this.layout ||
+            this.layout.nodes.length !== this.graph.nodes.length ||
+            this.layout.width !== bounds.width ||
+            this.layout.height !== bounds.height;
+        if (needsLayout) {
+            if (!this.requestLayout(bounds.width, bounds.height)) return;
+        } else if (!this.viewport) {
+            this.buildStructure();
         }
+        this.applyTransform();
+        this.applyHighlights();
+    }
+
+    // Small graphs are faster to lay out synchronously. Larger ones go to a
+    // worker so panning the rest of the UI stays responsive.
+    requestLayout(width, height) {
+        if (this.graph.nodes.length <= syncLayoutLimit || this.workerFailed || typeof Worker !== 'function') {
+            this.layout = layoutGraph(this.graph.nodes, this.graph.edges, width, height);
+            this.buildStructure();
+            this.applyPendingFit();
+            return true;
+        }
+        const requestID = ++this.layoutRequestID;
+        if (!this.worker) this.worker = this.createLayoutWorker();
+        if (!this.worker) {
+            this.workerFailed = true;
+            return this.requestLayout(width, height);
+        }
+        this.showLayoutPending(width, height);
+        this.worker.postMessage({
+            id: requestID,
+            nodes: this.graph.nodes,
+            edges: this.graph.edges,
+            width,
+            height
+        });
+        return false;
+    }
+
+    createLayoutWorker() {
+        try {
+            const worker = new Worker(new URL('./graph-layout-worker.js', import.meta.url), { type: 'module' });
+            worker.addEventListener('message', event => this.receiveLayout(event.data));
+            worker.addEventListener('error', () => {
+                this.worker?.terminate();
+                this.worker = null;
+                this.workerFailed = true;
+                const bounds = this.svg.getBoundingClientRect();
+                if (bounds.width < 1 || bounds.height < 1) return;
+                this.layout = layoutGraph(this.graph.nodes, this.graph.edges, bounds.width, bounds.height);
+                this.buildStructure();
+                this.applyTransform();
+                this.applyHighlights();
+                this.applyPendingFit();
+            });
+            return worker;
+        } catch {
+            return null;
+        }
+    }
+
+    receiveLayout(data) {
+        if (!data || data.id !== this.layoutRequestID) return;
+        const bounds = this.svg.getBoundingClientRect();
+        if (bounds.width < 1 || bounds.height < 1) return;
+        // The viewport changed while the worker was busy; request fresh
+        // dimensions instead of installing a stale layout.
+        if (Math.abs(data.layout.width - bounds.width) > 1 ||
+            Math.abs(data.layout.height - bounds.height) > 1) {
+            this.layout = null;
+            this.render();
+            return;
+        }
+        this.layout = data.layout;
+        this.buildStructure();
+        this.applyTransform();
+        this.applyHighlights();
+        this.applyPendingFit();
+    }
+
+    applyPendingFit() {
+        if (!this.fitAfterLayout) return;
+        this.fitAfterLayout = false;
+        this.fit();
+    }
+
+    showLayoutPending(width, height) {
+        if (this.viewport) return;
+        const label = svgElement('text', {
+            x: width / 2,
+            y: height / 2,
+            'text-anchor': 'middle',
+            class: 'graph-loading'
+        });
+        label.textContent = 'Calculando layout…';
+        this.svg.replaceChildren(label);
+    }
+
+    buildStructure() {
         const { width, height, nodes, edges } = this.layout;
         this.svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
         const defs = svgElement('defs');
@@ -214,30 +324,39 @@ export class GraphView {
         });
         marker.append(svgElement('path', { d: 'M 0 0 L 10 5 L 0 10 z', class: 'graph-arrowhead' }));
         defs.append(marker);
-        const viewport = svgElement('g', {
-            transform: `translate(${this.transform.x} ${this.transform.y}) scale(${this.transform.scale})`
-        });
+        const viewport = svgElement('g');
         const edgesGroup = svgElement('g', { class: 'graph-edges' });
         const nodesGroup = svgElement('g', { class: 'graph-nodes' });
-        const byID = new Map(nodes.map(node => [Number(node.id), node]));
+
+        this.nodeElements = new Map();
+        this.nodeById = new Map();
+        this.edgeRecords = [];
+        this.edgesByNode = new Map();
+        for (const node of nodes) {
+            const id = Number(node.id);
+            node.searchText = `${node.title} ${node.folder}`.toLocaleLowerCase();
+            this.nodeById.set(id, node);
+        }
+
         for (const edge of edges) {
-            const source = byID.get(Number(edge.source));
-            const target = byID.get(Number(edge.target));
-            if (!source || !target) continue;
-            const distance = Math.hypot(target.x - source.x, target.y - source.y) || 1;
-            const unitX = (target.x - source.x) / distance;
-            const unitY = (target.y - source.y) / distance;
-            const edgeElement = svgElement('line', {
-                x1: source.x + unitX * nodeRadius,
-                y1: source.y + unitY * nodeRadius,
-                x2: target.x - unitX * nodeRadius,
-                y2: target.y - unitY * nodeRadius,
+            const sourceID = Number(edge.source);
+            const targetID = Number(edge.target);
+            if (!this.nodeById.has(sourceID) || !this.nodeById.has(targetID)) continue;
+            const element = svgElement('line', {
                 class: `graph-edge${edge.type === 'wikilink' ? ' is-wikilink' : ''}`,
                 'data-source': edge.source, 'data-target': edge.target,
                 'marker-end': 'url(#graph-arrow)'
             });
-            edgesGroup.append(edgeElement);
+            const record = { element, sourceID, targetID };
+            this.edgeRecords.push(record);
+            if (!this.edgesByNode.has(sourceID)) this.edgesByNode.set(sourceID, []);
+            if (!this.edgesByNode.has(targetID)) this.edgesByNode.set(targetID, []);
+            this.edgesByNode.get(sourceID).push(record);
+            this.edgesByNode.get(targetID).push(record);
+            this.positionEdge(record);
+            edgesGroup.append(element);
         }
+
         for (const node of nodes) {
             const group = svgElement('g', {
                 class: 'graph-node',
@@ -258,11 +377,39 @@ export class GraphView {
             title.textContent = `${node.title}${node.folder ? ` · ${node.folder}` : ''} (${node.degree} conexões)`;
             group.append(circle, text, title);
             nodesGroup.append(group);
+            this.nodeElements.set(Number(node.id), group);
         }
+
         viewport.append(edgesGroup, nodesGroup);
         this.svg.replaceChildren(defs, viewport);
-        this.applyHighlights();
+        this.viewport = viewport;
         this.hasRendered = true;
+    }
+
+    positionEdge(record) {
+        const source = this.nodeById.get(record.sourceID);
+        const target = this.nodeById.get(record.targetID);
+        if (!source || !target) return;
+        const distance = Math.hypot(target.x - source.x, target.y - source.y) || 1;
+        const unitX = (target.x - source.x) / distance;
+        const unitY = (target.y - source.y) / distance;
+        record.element.setAttribute('x1', String(source.x + unitX * nodeRadius));
+        record.element.setAttribute('y1', String(source.y + unitY * nodeRadius));
+        record.element.setAttribute('x2', String(target.x - unitX * nodeRadius));
+        record.element.setAttribute('y2', String(target.y - unitY * nodeRadius));
+    }
+
+    positionNode(nodeID) {
+        const node = this.nodeById.get(nodeID);
+        const element = this.nodeElements.get(nodeID);
+        if (node && element) element.setAttribute('transform', `translate(${node.x} ${node.y})`);
+        for (const record of this.edgesByNode.get(nodeID) || []) this.positionEdge(record);
+    }
+
+    applyTransform() {
+        if (!this.viewport) return;
+        this.viewport.setAttribute('transform',
+            `translate(${this.transform.x} ${this.transform.y}) scale(${this.transform.scale})`);
     }
 
     applyHighlights() {
@@ -270,34 +417,30 @@ export class GraphView {
         const selectedID = this.hoveredNodeID;
         const neighbors = new Set();
         if (selectedID !== null) {
-            for (const edge of this.graph.edges) {
-                if (Number(edge.source) === selectedID) neighbors.add(Number(edge.target));
-                if (Number(edge.target) === selectedID) neighbors.add(Number(edge.source));
+            for (const record of this.edgesByNode.get(selectedID) || []) {
+                neighbors.add(record.sourceID === selectedID ? record.targetID : record.sourceID);
             }
         }
         const query = this.search;
-        const nodeElements = new Map(
-            [...this.svg.querySelectorAll('[data-node-id]')].map(element => [Number(element.dataset.nodeId), element])
-        );
-        const nodeByID = new Map(this.layout.nodes.map(node => [Number(node.id), node]));
         for (const node of this.layout.nodes) {
-            const element = nodeElements.get(Number(node.id));
+            const id = Number(node.id);
+            const element = this.nodeElements.get(id);
             if (!element) continue;
-            const matches = !query || `${node.title} ${node.folder}`.toLocaleLowerCase().includes(query);
-            const emphasized = selectedID === Number(node.id) || neighbors.has(Number(node.id));
-            element.classList.toggle('is-selected', selectedID === Number(node.id));
-            element.classList.toggle('is-neighbor', selectedID !== null && neighbors.has(Number(node.id)));
+            const matches = !query || node.searchText.includes(query);
+            const emphasized = selectedID === id || neighbors.has(id);
+            element.classList.toggle('is-selected', selectedID === id);
+            element.classList.toggle('is-neighbor', selectedID !== null && neighbors.has(id));
             element.classList.toggle('is-dimmed', !matches || (selectedID !== null && !emphasized));
         }
-        for (const edge of this.svg.querySelectorAll('.graph-edge')) {
-            const source = Number(edge.dataset.source);
-            const target = Number(edge.dataset.target);
+        for (const record of this.edgeRecords) {
+            const source = this.nodeById.get(record.sourceID);
+            const target = this.nodeById.get(record.targetID);
             const matches = !query ||
-                `${nodeByID.get(source)?.title || ''} ${nodeByID.get(target)?.title || ''}`
-                    .toLocaleLowerCase().includes(query);
-            const connected = selectedID === null || source === selectedID || target === selectedID;
-            edge.classList.toggle('is-dimmed', !matches || !connected);
-            edge.classList.toggle('is-highlighted', connected && selectedID !== null);
+                `${source?.searchText || ''} ${target?.searchText || ''}`.includes(query);
+            const connected = selectedID === null ||
+                record.sourceID === selectedID || record.targetID === selectedID;
+            record.element.classList.toggle('is-dimmed', !matches || !connected);
+            record.element.classList.toggle('is-highlighted', connected && selectedID !== null);
         }
     }
 
@@ -317,7 +460,7 @@ export class GraphView {
         const nodeElement = event.target.closest('[data-node-id]');
         if (nodeElement) {
             const nodeID = Number(nodeElement.dataset.nodeId);
-            const node = this.layout.nodes.find(item => Number(item.id) === nodeID);
+            const node = this.nodeById.get(nodeID);
             if (!node) return;
             const point = this.pointerPosition(event);
             this.drag = {
@@ -344,16 +487,16 @@ export class GraphView {
             this.drag.moved ||= Math.abs(dx) + Math.abs(dy) > 3;
             this.transform.x = this.drag.x + dx;
             this.transform.y = this.drag.y + dy;
-            this.render();
+            this.applyTransform();
             return;
         }
-        const node = this.layout.nodes.find(item => Number(item.id) === this.drag.nodeID);
+        const node = this.nodeById.get(this.drag.nodeID);
         if (!node) return;
         const point = this.pointerPosition(event);
         this.drag.moved ||= Math.abs(point.x - this.drag.startX) + Math.abs(point.y - this.drag.startY) > 3;
         node.x = point.x - this.drag.offsetX;
         node.y = point.y - this.drag.offsetY;
-        this.render();
+        this.positionNode(this.drag.nodeID);
     }
 
     endPointer(event) {
@@ -364,7 +507,7 @@ export class GraphView {
         if (moved) {
             this.ignoreNextClick = true;
             event.preventDefault();
-            this.render();
+            this.applyTransform();
             return;
         }
         // Pointer capture retargets the following click event to the <svg>, so a
@@ -386,11 +529,15 @@ export class GraphView {
         this.transform.x = cursorX - (cursorX - this.transform.x) * ratio;
         this.transform.y = cursorY - (cursorY - this.transform.y) * ratio;
         this.transform.scale = scale;
-        this.render();
+        this.applyTransform();
     }
 
     destroy() {
         window.clearTimeout(this.resizeTimer);
+        if (this.worker) {
+            this.worker.terminate();
+            this.worker = null;
+        }
         if (this.resizeObserver) this.resizeObserver.disconnect();
         else window.removeEventListener('resize', this.handleWindowResize);
     }

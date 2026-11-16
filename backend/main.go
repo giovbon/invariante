@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -25,10 +24,6 @@ import (
 	"unicode"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/yuin/goldmark"
-	"github.com/yuin/goldmark/ast"
-	"github.com/yuin/goldmark/extension"
-	"github.com/yuin/goldmark/text"
 )
 
 const (
@@ -81,8 +76,30 @@ type TagCount struct {
 	Count int    `json:"count"`
 }
 
+type tagCountsCache struct {
+	revision uint64
+	tags     []TagCount
+}
+
+type notesPageCache struct {
+	revision uint64
+	key      string
+	page     Page
+}
+
+type searchPageCache struct {
+	revision uint64
+	key      string
+	page     Page
+}
+
 type App struct {
-	db             *sql.DB
+	db *sql.DB
+	// readDB is a separate pool for read-only queries. SQLite in WAL mode
+	// supports concurrent readers, so a slow scan (tasks, table, search) no
+	// longer blocks edits or other tabs while the writer holds the only
+	// writable connection.
+	readDB         *sql.DB
 	attachmentsDir string
 	auth           *authenticator
 	backupMu       sync.Mutex
@@ -94,6 +111,23 @@ type App struct {
 	// write lock, so a restore can never swap the directory while a file is
 	// being written or while a backup is reading it.
 	dataMu sync.RWMutex
+	// shutdown asks long-lived handlers (the event stream) to stop during a
+	// graceful shutdown. Without it, Shutdown waits for the full timeout while
+	// open browser tabs keep their SSE connections alive.
+	shutdownOnce sync.Once
+	shutdown     chan struct{}
+	// cacheMu guards the revision-keyed read caches. dataRevision advances on
+	// every mutation that can change note titles, folders or links, so caches
+	// never serve stale graph, tag or link data.
+	cacheMu      sync.RWMutex
+	dataRevision uint64
+	linkIndex    *noteLinkIndex
+	graphCache   *noteGraphCache
+	tagsCache    *tagCountsCache
+	taskCache    []taskPageCache
+	tableCache   []tablePageCache
+	notesCache   []notesPageCache
+	searchCache  []searchPageCache
 }
 
 type folderBuilder struct {
@@ -106,7 +140,8 @@ func NewApp(dataDir string) (*App, error) {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "notes.db"))
+	dbPath := filepath.Join(dataDir, "notes.db")
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -115,6 +150,7 @@ func NewApp(dataDir string) (*App, error) {
 	app := &App{
 		db:             db,
 		attachmentsDir: filepath.Join(dataDir, "attachments"),
+		shutdown:       make(chan struct{}),
 	}
 
 	for _, statement := range []string{
@@ -122,6 +158,7 @@ func NewApp(dataDir string) (*App, error) {
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA synchronous = NORMAL",
 		"PRAGMA foreign_keys = ON",
+		"PRAGMA cache_size = -16384",
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			db.Close()
@@ -148,6 +185,11 @@ func NewApp(dataDir string) (*App, error) {
 			return nil, fmt.Errorf("parse AUTHENTICATION_COOKIE_SECURE: %w", err)
 		}
 	}
+	app.readDB, err = openReadDatabase(dbPath)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open read-only database: %w", err)
+	}
 	if app.auth.enabled() {
 		log.Printf("Authentication enabled")
 	} else {
@@ -157,8 +199,59 @@ func NewApp(dataDir string) (*App, error) {
 	return app, nil
 }
 
+// openReadDatabase creates a small pool of read-only connections. WAL mode
+// lets them run while a write transaction is in flight, which keeps the UI
+// responsive during saves and removes the single-connection bottleneck.
+func openReadDatabase(dbPath string) (*sql.DB, error) {
+	absolutePath, err := filepath.Abs(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	dsn := (&url.URL{
+		Scheme:   "file",
+		Path:     absolutePath,
+		RawQuery: "_busy_timeout=5000&_query_only=on&_cache_size=-8192",
+	}).String()
+	readDB, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, err
+	}
+	readDB.SetMaxOpenConns(4)
+	readDB.SetMaxIdleConns(4)
+	if err := readDB.Ping(); err != nil {
+		readDB.Close()
+		return nil, err
+	}
+	return readDB, nil
+}
+
 func (a *App) Close() error {
-	return a.db.Close()
+	// Let SQLite refresh its statistics for the next run. Errors are not
+	// actionable during shutdown and must not prevent closing the pools.
+	if _, err := a.db.Exec("PRAGMA optimize"); err != nil {
+		log.Printf("optimize database on close: %v", err)
+	}
+	var readErr error
+	if a.readDB != nil {
+		readErr = a.readDB.Close()
+		a.readDB = nil
+	}
+	return errors.Join(a.db.Close(), readErr)
+}
+
+// markDataChanged invalidates the read caches. It is called after every
+// mutation that may change note titles, folders or links, including content
+// saves that do not need to notify the folder tree.
+func (a *App) markDataChanged() {
+	a.cacheMu.Lock()
+	a.dataRevision++
+	a.cacheMu.Unlock()
+}
+
+func (a *App) currentDataRevision() uint64 {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	return a.dataRevision
 }
 
 func (a *App) migrate() error {
@@ -175,7 +268,7 @@ func (a *App) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder)`,
 		`CREATE INDEX IF NOT EXISTS idx_notes_folder_title ON notes(folder, title COLLATE NOCASE)`,
-		`CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at DESC, rowid DESC)`,
 		`CREATE TABLE IF NOT EXISTS schema_migrations (
 			version INTEGER PRIMARY KEY,
 			applied_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -216,6 +309,9 @@ func (a *App) migrate() error {
 		{version: 3, apply: migrateNoteVersions},
 		{version: 5, apply: migrateRemoveNoteHistory},
 		{version: 6, apply: migrateAppSettings},
+		{version: 7, apply: migrateConditionalFTSTrigger},
+		{version: 8, apply: migrateDerivedNoteMetadata},
+		{version: 9, apply: migrateQueryIndexes},
 	}
 	for _, migration := range migrations {
 		var applied int
@@ -277,7 +373,9 @@ func migrateSearchIndex(tx *sql.Tx) error {
 			INSERT INTO notes_fts(notes_fts, rowid, title, content)
 			VALUES ('delete', old.rowid, old.title, old.content);
 		END`,
-		`CREATE TRIGGER IF NOT EXISTS notes_fts_update AFTER UPDATE ON notes BEGIN
+		`CREATE TRIGGER IF NOT EXISTS notes_fts_update AFTER UPDATE ON notes
+			WHEN old.title IS NOT new.title OR old.content IS NOT new.content
+			BEGIN
 			INSERT INTO notes_fts(notes_fts, rowid, title, content)
 			VALUES ('delete', old.rowid, old.title, old.content);
 			INSERT INTO notes_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content);
@@ -398,18 +496,71 @@ func migrateAppSettings(tx *sql.Tx) error {
 	return err
 }
 
+// migrateConditionalFTSTrigger replaces the original trigger, which reindexed
+// the whole note content on every UPDATE. Moving a folder, renaming a tag or
+// bumping the version only needs a new FTS row when the indexed columns change.
+func migrateConditionalFTSTrigger(tx *sql.Tx) error {
+	statements := []string{
+		`DROP TRIGGER IF EXISTS notes_fts_update`,
+		`CREATE TRIGGER notes_fts_update AFTER UPDATE ON notes
+			WHEN old.title IS NOT new.title OR old.content IS NOT new.content
+			BEGIN
+			INSERT INTO notes_fts(notes_fts, rowid, title, content)
+			VALUES ('delete', old.rowid, old.title, old.content);
+			INSERT INTO notes_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content);
+		END`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateQueryIndexes aligns the hot-path indexes with the actual ORDER BY
+// clauses (updated_at DESC, rowid DESC) and adds the target lookup used by
+// link maintenance and future backlink queries.
+func migrateQueryIndexes(tx *sql.Tx) error {
+	statements := []string{
+		`DROP INDEX IF EXISTS idx_notes_updated`,
+		`CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at DESC, rowid DESC)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (a *App) ListNotes(folder, tag string, limit, offset int) (Page, error) {
+	revision := a.currentDataRevision()
+	cacheKey := fmt.Sprintf("%s\x00%s|%d|%d", folder, tag, limit, offset)
+	a.cacheMu.Lock()
+	for _, entry := range a.notesCache {
+		if entry.revision == revision && entry.key == cacheKey {
+			page := entry.page
+			a.cacheMu.Unlock()
+			return page, nil
+		}
+	}
+	a.cacheMu.Unlock()
 	var total int
-	if err := a.db.QueryRow(`SELECT COUNT(*) FROM notes
+	if err := a.readDB.QueryRow(`SELECT COUNT(*) FROM notes
 		WHERE (folder = ? OR ? = '')
-		AND (? = '' OR instr(',' || lower(COALESCE(tags, '')) || ',', ',' || lower(?) || ',') > 0)`,
+		AND (? = '' OR EXISTS (
+			SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?
+		))`,
 		folder, folder, tag, tag).Scan(&total); err != nil {
 		return Page{}, err
 	}
-	rows, err := a.db.Query(`SELECT rowid, title, folder, substr(COALESCE(content, ''), 1, 180), updated_at, COALESCE(tags, '')
+	rows, err := a.readDB.Query(`SELECT rowid, title, folder, substr(COALESCE(content, ''), 1, 180), updated_at, COALESCE(tags, '')
 		FROM notes
 		WHERE (folder = ? OR ? = '')
-		AND (? = '' OR instr(',' || lower(COALESCE(tags, '')) || ',', ',' || lower(?) || ',') > 0)
+		AND (? = '' OR EXISTS (
+			SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?
+		))
 		ORDER BY updated_at DESC, rowid DESC LIMIT ? OFFSET ?`,
 		folder, folder, tag, tag, limit, offset)
 	if err != nil {
@@ -420,87 +571,68 @@ func (a *App) ListNotes(folder, tag string, limit, offset int) (Page, error) {
 	if err != nil {
 		return Page{}, err
 	}
-	return Page{Items: items, Total: total, Limit: limit, Offset: offset}, nil
+	page := Page{Items: items, Total: total, Limit: limit, Offset: offset}
+	a.cacheMu.Lock()
+	a.notesCache = append(a.notesCache, notesPageCache{revision: revision, key: cacheKey, page: page})
+	if len(a.notesCache) > 8 {
+		a.notesCache = a.notesCache[len(a.notesCache)-8:]
+	}
+	a.cacheMu.Unlock()
+	return page, nil
 }
 
 func (a *App) ListFolderNotes(folder string, limit, offset int) (Page, error) {
-	rows, err := a.db.Query(`SELECT rowid, title, folder, substr(COALESCE(content, ''), 1, 180),
-		updated_at, COALESCE(tags, ''), COALESCE(content, '')
-		FROM notes WHERE folder = ?
-		ORDER BY title COLLATE NOCASE, rowid`, folder)
+	var total int
+	if err := a.readDB.QueryRow(`SELECT COUNT(*) FROM notes
+		WHERE folder = ? AND hide_from_explorer = 0`, folder).Scan(&total); err != nil {
+		return Page{}, err
+	}
+	rows, err := a.readDB.Query(`SELECT rowid, title, folder, substr(COALESCE(content, ''), 1, 180),
+		updated_at, COALESCE(tags, '')
+		FROM notes WHERE folder = ? AND hide_from_explorer = 0
+		ORDER BY title COLLATE NOCASE, rowid LIMIT ? OFFSET ?`, folder, limit, offset)
 	if err != nil {
 		return Page{}, err
 	}
 	defer rows.Close()
-	items := make([]NoteSummary, 0, limit)
-	total := 0
-	for rows.Next() {
-		var item NoteSummary
-		var tags, content string
-		if err := rows.Scan(&item.ID, &item.Title, &item.Folder, &item.Preview,
-			&item.UpdatedAt, &tags, &content); err != nil {
-			return Page{}, err
-		}
-		if frontmatterHidesFromExplorer(content) {
-			continue
-		}
-		if total >= offset && len(items) < limit {
-			item.Tags = splitTags(tags)
-			items = append(items, item)
-		}
-		total++
-	}
-	if err := rows.Err(); err != nil {
+	items, err := scanSummaries(rows)
+	if err != nil {
 		return Page{}, err
 	}
 	return Page{Items: items, Total: total, Limit: limit, Offset: offset}, nil
 }
 
 func (a *App) Tags() ([]TagCount, error) {
-	rows, err := a.db.Query("SELECT COALESCE(tags, '') FROM notes")
+	revision := a.currentDataRevision()
+	a.cacheMu.RLock()
+	cached := a.tagsCache
+	a.cacheMu.RUnlock()
+	if cached != nil && cached.revision == revision {
+		return cached.tags, nil
+	}
+
+	rows, err := a.readDB.Query(`SELECT tag, COUNT(*) FROM note_tags
+		GROUP BY tag ORDER BY COUNT(*) DESC, lower(tag)`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	counts := make(map[string]int)
-	names := make(map[string]string)
+	result := make([]TagCount, 0)
 	for rows.Next() {
-		var tags string
-		if err := rows.Scan(&tags); err != nil {
+		var item TagCount
+		if err := rows.Scan(&item.Name, &item.Count); err != nil {
 			return nil, err
 		}
-		seen := make(map[string]struct{})
-		for _, tag := range strings.Split(tags, ",") {
-			tag = strings.TrimSpace(tag)
-			if tag == "" {
-				continue
-			}
-			key := strings.ToLower(tag)
-			if _, duplicate := seen[key]; duplicate {
-				continue
-			}
-			seen[key] = struct{}{}
-			if _, exists := names[key]; !exists {
-				names[key] = tag
-			}
-			counts[key]++
-		}
+		result = append(result, item)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	result := make([]TagCount, 0, len(counts))
-	for key, count := range counts {
-		result = append(result, TagCount{Name: names[key], Count: count})
-	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Count != result[j].Count {
-			return result[i].Count > result[j].Count
-		}
-		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
-	})
+	a.cacheMu.Lock()
+	a.tagsCache = &tagCountsCache{revision: revision, tags: result}
+	a.cacheMu.Unlock()
 	return result, nil
 }
 
@@ -509,21 +641,36 @@ func (a *App) SearchNotes(query, mode, folder, tag string, limit, offset int) (P
 	if err != nil {
 		return Page{}, err
 	}
+	revision := a.currentDataRevision()
+	cacheKey := fmt.Sprintf("%s\x00%s\x00%s\x00%s|%d|%d", query, mode, folder, tag, limit, offset)
+	a.cacheMu.Lock()
+	for _, entry := range a.searchCache {
+		if entry.revision == revision && entry.key == cacheKey {
+			page := entry.page
+			a.cacheMu.Unlock()
+			return page, nil
+		}
+	}
+	a.cacheMu.Unlock()
 	var total int
-	if err := a.db.QueryRow(`SELECT COUNT(*)
+	if err := a.readDB.QueryRow(`SELECT COUNT(*)
 		FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
 		WHERE notes_fts MATCH ? AND (n.folder = ? OR ? = '')
-		AND (? = '' OR instr(',' || lower(COALESCE(n.tags, '')) || ',', ',' || lower(?) || ',') > 0)`,
+		AND (? = '' OR EXISTS (
+			SELECT 1 FROM note_tags nt WHERE nt.note_id = n.rowid AND nt.tag = ?
+		))`,
 		match, folder, folder, tag, tag).Scan(&total); err != nil {
 		return Page{}, err
 	}
 
 	if mode == "content" {
-		rows, err := a.db.Query(`SELECT n.rowid, n.title, n.folder,
+		rows, err := a.readDB.Query(`SELECT n.rowid, n.title, n.folder,
 			highlight(notes_fts, 1, char(30), char(31)), n.updated_at, COALESCE(n.tags, '')
 			FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
 			WHERE notes_fts MATCH ? AND (n.folder = ? OR ? = '')
-			AND (? = '' OR instr(',' || lower(COALESCE(n.tags, '')) || ',', ',' || lower(?) || ',') > 0)
+			AND (? = '' OR EXISTS (
+				SELECT 1 FROM note_tags nt WHERE nt.note_id = n.rowid AND nt.tag = ?
+			))
 			ORDER BY notes_fts.rank, n.updated_at DESC, n.rowid DESC LIMIT ? OFFSET ?`,
 			match, folder, folder, tag, tag, limit, offset)
 		if err != nil {
@@ -534,13 +681,15 @@ func (a *App) SearchNotes(query, mode, folder, tag string, limit, offset int) (P
 		if err != nil {
 			return Page{}, err
 		}
-		return Page{Items: items, Total: total, Limit: limit, Offset: offset}, nil
+		return a.cacheSearchPage(revision, cacheKey, Page{Items: items, Total: total, Limit: limit, Offset: offset}), nil
 	}
 
-	rows, err := a.db.Query(`SELECT n.rowid, n.title, n.folder, substr(COALESCE(n.content, ''), 1, 180), n.updated_at, COALESCE(n.tags, '')
+	rows, err := a.readDB.Query(`SELECT n.rowid, n.title, n.folder, substr(COALESCE(n.content, ''), 1, 180), n.updated_at, COALESCE(n.tags, '')
 		FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
 		WHERE notes_fts MATCH ? AND (n.folder = ? OR ? = '')
-		AND (? = '' OR instr(',' || lower(COALESCE(n.tags, '')) || ',', ',' || lower(?) || ',') > 0)
+		AND (? = '' OR EXISTS (
+			SELECT 1 FROM note_tags nt WHERE nt.note_id = n.rowid AND nt.tag = ?
+		))
 		ORDER BY notes_fts.rank, n.updated_at DESC, n.rowid DESC LIMIT ? OFFSET ?`,
 		match, folder, folder, tag, tag, limit, offset)
 	if err != nil {
@@ -551,7 +700,17 @@ func (a *App) SearchNotes(query, mode, folder, tag string, limit, offset int) (P
 	if err != nil {
 		return Page{}, err
 	}
-	return Page{Items: items, Total: total, Limit: limit, Offset: offset}, nil
+	return a.cacheSearchPage(revision, cacheKey, Page{Items: items, Total: total, Limit: limit, Offset: offset}), nil
+}
+
+func (a *App) cacheSearchPage(revision uint64, key string, page Page) Page {
+	a.cacheMu.Lock()
+	a.searchCache = append(a.searchCache, searchPageCache{revision: revision, key: key, page: page})
+	if len(a.searchCache) > 8 {
+		a.searchCache = a.searchCache[len(a.searchCache)-8:]
+	}
+	a.cacheMu.Unlock()
+	return page
 }
 
 // NoteOccurrences returns every excerpt where the query matches the content of
@@ -563,7 +722,7 @@ func (a *App) NoteOccurrences(id int64, query string) ([]string, int, error) {
 		return nil, 0, err
 	}
 	var marked string
-	err = a.db.QueryRow(`SELECT highlight(notes_fts, 1, char(30), char(31))
+	err = a.readDB.QueryRow(`SELECT highlight(notes_fts, 1, char(30), char(31))
 		FROM notes_fts WHERE rowid = ? AND notes_fts MATCH ?`, id, match).Scan(&marked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, 0, nil
@@ -732,7 +891,7 @@ func makeFTSQuery(query, mode string) (string, error) {
 func (a *App) GetNote(id int64) (Note, error) {
 	var note Note
 	var tags string
-	err := a.db.QueryRow(`SELECT rowid, title, COALESCE(content, ''), COALESCE(folder, ''),
+	err := a.readDB.QueryRow(`SELECT rowid, title, COALESCE(content, ''), COALESCE(folder, ''),
 		COALESCE(tags, ''), version, created_at, updated_at FROM notes WHERE rowid = ?`, id).
 		Scan(&note.ID, &note.Title, &note.Content, &note.Folder, &tags, &note.Version,
 			&note.CreatedAt, &note.UpdatedAt)
@@ -770,9 +929,13 @@ func (a *App) CreateNote(note Note) (int64, error) {
 	if err := replaceNoteLinks(tx, id, note.Content); err != nil {
 		return 0, err
 	}
+	if err := syncNoteMetadata(tx, id, note.Content, note.Tags); err != nil {
+		return 0, err
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	a.markDataChanged()
 	a.notifyChange()
 	return id, nil
 }
@@ -800,12 +963,13 @@ func (a *App) UpdateNote(id int64, note Note) error {
 	var before []indexedNote
 	var byPath, byTitle map[string]int64
 	if titleChanged || folderChanged {
-		before, err = readNotesForLinksWith(tx)
+		index, err := a.noteIndex()
 		if err != nil {
 			return err
 		}
+		before = index.notes
 		if titleChanged && !folderChanged {
-			byPath, byTitle = makeNoteLinkIndexes(before)
+			byPath, byTitle = index.byPath, index.byTitle
 		}
 	}
 	result, err := tx.Exec(`UPDATE notes SET title = ?, content = ?, folder = ?, tags = ?,
@@ -822,10 +986,7 @@ func (a *App) UpdateNote(id int64, note Note) error {
 		return sql.ErrNoRows
 	}
 	if folderChanged {
-		after, err := readNotesForLinksWith(tx)
-		if err != nil {
-			return err
-		}
+		after := notesWithFolder(before, id, note.Title, note.Folder)
 		if err := relinkNotesAfterMove(tx, before, after, id); err != nil {
 			return err
 		}
@@ -837,9 +998,13 @@ func (a *App) UpdateNote(id int64, note Note) error {
 	if err := replaceNoteLinks(tx, id, note.Content); err != nil {
 		return err
 	}
+	if err := syncNoteMetadata(tx, id, note.Content, note.Tags); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	a.markDataChanged()
 	if titleChanged || folderChanged {
 		a.notifyChange()
 	}
@@ -856,9 +1021,20 @@ func (a *App) MoveNoteFolder(id int64, folder string) error {
 		return err
 	}
 	defer tx.Rollback()
-	before, err := readNotesForLinksWith(tx)
+	index, err := a.noteIndex()
 	if err != nil {
 		return err
+	}
+	before := index.notes
+	old, found := indexedNoteByID(before, id)
+	if !found {
+		// The cache should contain every note; fall back to the transaction
+		// view if an inconsistent write ever left it behind.
+		before, err = readNotesForLinksWith(tx)
+		if err != nil {
+			return err
+		}
+		old, found = indexedNoteByID(before, id)
 	}
 	result, err := tx.Exec(`UPDATE notes SET folder = ?, version = version + 1,
 		updated_at = datetime('now') WHERE rowid = ?`, folder, id)
@@ -872,16 +1048,16 @@ func (a *App) MoveNoteFolder(id int64, folder string) error {
 	if count == 0 {
 		return sql.ErrNoRows
 	}
-	after, err := readNotesForLinksWith(tx)
-	if err != nil {
-		return err
-	}
-	if err := relinkNotesAfterMove(tx, before, after, 0); err != nil {
-		return err
+	if found && old.Folder != folder {
+		after := notesWithFolder(before, id, old.Title, folder)
+		if err := relinkNotesAfterMove(tx, before, after, 0); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	a.markDataChanged()
 	a.notifyChange()
 	return nil
 }
@@ -954,10 +1130,11 @@ func (a *App) DeleteFolder(folder string) (int64, error) {
 		return 0, sql.ErrNoRows
 	}
 
-	before, err := readNotesForLinksWith(tx)
+	index, err := a.noteIndex()
 	if err != nil {
 		return 0, err
 	}
+	before := index.notes
 	if _, err := tx.Exec(`UPDATE notes SET folder = '', version = version + 1,
 		updated_at = datetime('now')
 		WHERE folder = ? OR substr(folder, 1, length(?) + 1) = ? || '/'`,
@@ -969,16 +1146,14 @@ func (a *App) DeleteFolder(folder string) (int64, error) {
 		folder, folder, folder); err != nil {
 		return 0, err
 	}
-	after, err := readNotesForLinksWith(tx)
-	if err != nil {
-		return 0, err
-	}
+	after := notesAfterFolderDelete(before, folder)
 	if err := relinkNotesAfterMove(tx, before, after, 0); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	a.markDataChanged()
 	a.notifyChange()
 	return noteCount, nil
 }
@@ -999,10 +1174,11 @@ func (a *App) moveFolder(source, destination string) (string, int64, error) {
 		return "", 0, err
 	}
 	defer tx.Rollback()
-	before, err := readNotesForLinksWith(tx)
+	index, err := a.noteIndex()
 	if err != nil {
 		return "", 0, err
 	}
+	before := index.notes
 
 	var count, folderCount int64
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM notes
@@ -1068,16 +1244,14 @@ func (a *App) moveFolder(source, destination string) (string, int64, error) {
 			return "", 0, err
 		}
 	}
-	after, err := readNotesForLinksWith(tx)
-	if err != nil {
-		return "", 0, err
-	}
+	after := notesAfterFolderMove(before, source, destination)
 	if err := relinkNotesAfterMove(tx, before, after, 0); err != nil {
 		return "", 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return "", 0, err
 	}
+	a.markDataChanged()
 	a.notifyChange()
 	return destination, count, nil
 }
@@ -1101,6 +1275,7 @@ func (a *App) DeleteNote(id int64) error {
 	if err := os.RemoveAll(noteDir); err != nil {
 		log.Printf("remove attachments for deleted note %d: %v", id, err)
 	}
+	a.markDataChanged()
 	a.notifyChange()
 	return nil
 }
@@ -1131,6 +1306,9 @@ func validateNote(note *Note) error {
 }
 
 func frontmatterTags(content string) ([]string, bool) {
+	if !hasFrontmatter(content) {
+		return nil, false
+	}
 	lines := strings.Split(content, "\n")
 	if len(lines) < 3 || strings.TrimSpace(lines[0]) != "---" {
 		return nil, false
@@ -1182,9 +1360,15 @@ func frontmatterTags(content string) ([]string, bool) {
 	return nil, false
 }
 
-func frontmatterHidesFromExplorer(content string) bool {
-	hidden, ok := frontmatterProperties(content)["hide_from_explorer"].(bool)
-	return ok && hidden
+// hasFrontmatter cheaply checks the first line before any full-content split.
+// Notes without metadata are the common case, and splitting several MiB just
+// to discover there is no frontmatter is wasteful.
+func hasFrontmatter(content string) bool {
+	end := strings.IndexByte(content, '\n')
+	if end < 0 {
+		end = len(content)
+	}
+	return strings.TrimSpace(content[:end]) == "---"
 }
 
 func normalizeFolder(value string) (string, error) {
@@ -1210,7 +1394,7 @@ func normalizeFolder(value string) (string, error) {
 }
 
 func (a *App) FolderTree() ([]Folder, error) {
-	rows, err := a.db.Query(`SELECT path FROM folders
+	rows, err := a.readDB.Query(`SELECT path FROM folders
 		UNION SELECT DISTINCT folder FROM notes WHERE folder != ''
 		ORDER BY 1`)
 	if err != nil {
@@ -1287,8 +1471,8 @@ func (a *App) Handler(frontendDir string) http.Handler {
 	mux.HandleFunc("/api/table", a.handleTable)
 	mux.HandleFunc("/api/graph", a.handleGraph)
 	mux.HandleFunc("/api/preview", a.handlePreview)
-	mux.Handle("/", revalidateStaticFiles(http.FileServer(http.Dir(frontendDir))))
-	return requestLogger(a.auth.middleware(mux))
+	mux.Handle("/", publicFrontendFiles(staticFiles(frontendDir)))
+	return requestLogger(a.auth.middleware(gzipResponses(mux)))
 }
 
 // requestLogger records failed or slow requests plus API mutations. Static
@@ -1340,19 +1524,6 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
-// revalidateStaticFiles prevents the browser from reusing a cached frontend
-// bundle after the server is rebuilt. http.FileServer only sends Last-Modified,
-// so browsers may serve script and stylesheet files heuristically for hours;
-// refreshing the page would then keep an old main.js while loading the newer
-// index.html. The no-cache directive still allows 304 responses for unchanged
-// files, so revalidation stays cheap.
-func revalidateStaticFiles(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
-		next.ServeHTTP(w, r)
-	})
-}
-
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -1362,6 +1533,11 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	if err := a.db.PingContext(ctx); err != nil {
 		log.Printf("health check: %v", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "error"})
+		return
+	}
+	if err := a.readDB.PingContext(ctx); err != nil {
+		log.Printf("health check (read pool): %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "error"})
 		return
 	}
@@ -1667,13 +1843,33 @@ func (a *App) handleTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		markers = saved
 	}
-	tasks, err := a.ListTasks(markers)
+	tasks, err := a.listTasks(markers, taskLimit(r), taskOffset(r))
 	if err != nil {
 		log.Printf("load tasks: %v", err)
 		http.Error(w, "failed to load tasks", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, tasks)
+}
+
+func taskLimit(r *http.Request) int {
+	limit := maxTaskResults
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 1 && parsed <= maxTaskResults {
+			limit = parsed
+		}
+	}
+	return limit
+}
+
+func taskOffset(r *http.Request) int {
+	offset := 0
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
+	return offset
 }
 
 func (a *App) handleFolderMove(w http.ResponseWriter, r *http.Request) {
@@ -1796,133 +1992,6 @@ func (a *App) handleFolderNotes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, page)
 }
 
-func (a *App) handlePreview(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w)
-		return
-	}
-	source, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxContentSize))
-	if err != nil {
-		var maxBytesError *http.MaxBytesError
-		if errors.As(err, &maxBytesError) {
-			http.Error(w, "markdown content exceeds the 5 MiB limit", http.StatusRequestEntityTooLarge)
-		} else {
-			http.Error(w, "failed to read markdown content", http.StatusBadRequest)
-		}
-		return
-	}
-	if rawID := r.Header.Get("X-Note-ID"); rawID != "" {
-		noteID, err := strconv.ParseInt(rawID, 10, 64)
-		if err != nil || noteID < 1 {
-			http.Error(w, "invalid note ID", http.StatusBadRequest)
-			return
-		}
-		note, err := a.GetNote(noteID)
-		if errors.Is(err, sql.ErrNoRows) {
-			http.NotFound(w, r)
-			return
-		}
-		if err != nil {
-			log.Printf("load note %d for preview: %v", noteID, err)
-			http.Error(w, "failed to load note for preview", http.StatusInternalServerError)
-			return
-		}
-		notes, err := a.readNotesForLinks()
-		if err != nil {
-			log.Printf("load note index for preview: %v", err)
-			http.Error(w, "failed to load notes for preview", http.StatusInternalServerError)
-			return
-		}
-		byPath, byTitle := makeNoteLinkIndexes(notes)
-		source = []byte(convertWikilinksToMarkdown(string(source),
-			indexedNote{GraphNode: GraphNode{ID: note.ID, Title: note.Title, Folder: note.Folder}},
-			byPath, byTitle))
-	}
-	renderMarkdownPreview(w, source)
-}
-
-func renderMarkdownPreview(w http.ResponseWriter, source []byte) {
-	md := goldmark.New(goldmark.WithExtensions(extension.GFM))
-	document := md.Parser().Parse(text.NewReader(source))
-	if err := ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
-		if !entering {
-			return ast.WalkContinue, nil
-		}
-		switch link := node.(type) {
-		case *ast.Link:
-			if !safeMarkdownDestination(link.Destination) {
-				link.Destination = []byte("#")
-			}
-		case *ast.Image:
-			if !safeMarkdownDestination(link.Destination) {
-				link.Destination = []byte("#")
-			}
-		}
-		// The preview is also used to jump to a specific line (tasks,
-		// backlinks, outline). Annotate the blocks that can hold a line of
-		// text so the client can locate the exact scroll position.
-		switch node.Kind() {
-		case ast.KindParagraph, ast.KindListItem, ast.KindBlockquote:
-			if line, ok := previewSourceLine(node, source); ok {
-				node.SetAttributeString("data-source-line", strconv.Itoa(line))
-			}
-		}
-		return ast.WalkContinue, nil
-	}); err != nil {
-		log.Printf("walk markdown AST: %v", err)
-		http.Error(w, "failed to render markdown", http.StatusInternalServerError)
-		return
-	}
-
-	var rendered bytes.Buffer
-	if err := md.Renderer().Render(&rendered, source, document); err != nil {
-		log.Printf("render markdown: %v", err)
-		http.Error(w, "failed to render markdown", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write(rendered.Bytes()); err != nil {
-		log.Printf("write markdown preview: %v", err)
-	}
-}
-
-// previewSourceLine returns the zero-based line of a block in the preview
-// source. Lists and blockquotes do not expose line segments themselves, so
-// their first descendant text block provides the position.
-func previewSourceLine(node ast.Node, source []byte) (int, bool) {
-	if node.Type() != ast.TypeBlock {
-		return 0, false
-	}
-	if lines := node.Lines(); lines.Len() > 0 {
-		start := lines.At(0).Start
-		if start < 0 || start > len(source) {
-			return 0, false
-		}
-		return bytes.Count(source[:start], []byte{'\n'}), true
-	}
-	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
-		if line, ok := previewSourceLine(child, source); ok {
-			return line, true
-		}
-	}
-	return 0, false
-}
-
-func safeMarkdownDestination(destination []byte) bool {
-	parsed, err := url.Parse(strings.TrimSpace(string(destination)))
-	if err != nil {
-		return false
-	}
-	switch strings.ToLower(parsed.Scheme) {
-	case "", "http", "https", "mailto":
-		return true
-	default:
-		return false
-	}
-}
-
 func pageParameters(r *http.Request) (int, int, error) {
 	limit := defaultPageSize
 	offset := 0
@@ -2039,6 +2108,7 @@ func main() {
 		defer close(shutdownDone)
 		<-signals.Done()
 		log.Printf("Shutting down; closing database cleanly")
+		app.closeEvents()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownContext); err != nil {

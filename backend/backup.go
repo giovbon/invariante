@@ -65,21 +65,34 @@ type backupAttachment struct {
 	ArchivePath string `json:"archive_path,omitempty"`
 }
 
+// backupAttachmentFile carries attachment metadata alongside the on-disk path
+// that still has to be copied into the archive.
+type backupAttachmentFile struct {
+	meta backupAttachment
+	path string
+}
+
 // ExportBackup writes a logical archive with a manifest and every attachment
 // file. Note IDs are preserved so attachment URLs stored in note content keep
-// working after a restore.
+// working after a restore. Note bodies are streamed instead of accumulated in
+// memory, so the export size is bounded by the archive rather than the library.
 func (a *App) ExportBackup(destination io.Writer) error {
 	// Keep deletions out while the archive reads attachment files.
 	a.dataMu.RLock()
 	defer a.dataMu.RUnlock()
 
-	manifest := backupManifest{
-		Format:    backupFormat,
-		Version:   backupVersion,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	// A read transaction gives the note files and the manifest the same
+	// snapshot even if another tab saves a note while the backup runs.
+	tx, err := a.readDB.Begin()
+	if err != nil {
+		return err
 	}
+	defer tx.Rollback()
 
-	rows, err := a.db.Query(`SELECT rowid, title, COALESCE(content, ''), COALESCE(folder, ''),
+	archive := zip.NewWriter(destination)
+	notesByID := make(map[int64]backupNote)
+
+	rows, err := tx.Query(`SELECT rowid, title, COALESCE(content, ''), COALESCE(folder, ''),
 		COALESCE(tags, ''), version, created_at, updated_at FROM notes ORDER BY rowid`)
 	if err != nil {
 		return err
@@ -92,12 +105,25 @@ func (a *App) ExportBackup(destination io.Writer) error {
 			rows.Close()
 			return err
 		}
-		for _, tag := range strings.Split(tags, ",") {
-			if tag = strings.TrimSpace(tag); tag != "" {
-				note.Tags = append(note.Tags, tag)
-			}
+		note.Tags = splitTags(tags)
+		// Only metadata is retained; the body is written to the zip and
+		// released before the next row is read.
+		notesByID[note.ID] = backupNote{ID: note.ID, Title: note.Title, Folder: note.Folder}
+		header := &zip.FileHeader{
+			Name:     backupNotePath(note),
+			Method:   zip.Deflate,
+			Modified: time.Now(),
 		}
-		manifest.Notes = append(manifest.Notes, note)
+		header.SetMode(0600)
+		writer, err := archive.CreateHeader(header)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		if _, err := io.WriteString(writer, note.Content); err != nil {
+			rows.Close()
+			return err
+		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -107,7 +133,8 @@ func (a *App) ExportBackup(destination io.Writer) error {
 		return err
 	}
 
-	rows, err = a.db.Query("SELECT path FROM folders ORDER BY path")
+	folders := make([]string, 0)
+	rows, err = tx.Query("SELECT path FROM folders ORDER BY path")
 	if err != nil {
 		return err
 	}
@@ -117,7 +144,7 @@ func (a *App) ExportBackup(destination io.Writer) error {
 			rows.Close()
 			return err
 		}
-		manifest.Folders = append(manifest.Folders, folder)
+		folders = append(folders, folder)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -127,21 +154,13 @@ func (a *App) ExportBackup(destination io.Writer) error {
 		return err
 	}
 
-	notesByID := make(map[int64]backupNote, len(manifest.Notes))
-	for _, note := range manifest.Notes {
-		notesByID[note.ID] = note
-	}
-
-	rows, err = a.db.Query(`SELECT id, note_id, filename, storage_name, media_type, size, created_at
+	attachments := make([]backupAttachment, 0)
+	files := make([]backupAttachmentFile, 0)
+	rows, err = tx.Query(`SELECT id, note_id, filename, storage_name, media_type, size, created_at
 		FROM attachments ORDER BY note_id, id`)
 	if err != nil {
 		return err
 	}
-	type attachmentFile struct {
-		meta backupAttachment
-		path string
-	}
-	files := make([]attachmentFile, 0)
 	for rows.Next() {
 		var item backupAttachment
 		if err := rows.Scan(&item.ID, &item.NoteID, &item.Filename, &item.StorageName,
@@ -159,8 +178,8 @@ func (a *App) ExportBackup(destination io.Writer) error {
 			return err
 		}
 		item.ArchivePath = backupAttachmentPath(notesByID[item.NoteID], item.StorageName)
-		manifest.Attachments = append(manifest.Attachments, item)
-		files = append(files, attachmentFile{meta: item, path: filePath})
+		attachments = append(attachments, item)
+		files = append(files, backupAttachmentFile{meta: item, path: filePath})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -170,35 +189,6 @@ func (a *App) ExportBackup(destination io.Writer) error {
 		return err
 	}
 
-	archive := zip.NewWriter(destination)
-	manifestWriter, err := archive.CreateHeader(&zip.FileHeader{
-		Name:     "manifest.json",
-		Method:   zip.Deflate,
-		Modified: time.Now(),
-	})
-	if err != nil {
-		return err
-	}
-	encoder := json.NewEncoder(manifestWriter)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(manifest); err != nil {
-		return err
-	}
-	for _, note := range manifest.Notes {
-		header := &zip.FileHeader{
-			Name:     backupNotePath(note),
-			Method:   zip.Deflate,
-			Modified: time.Now(),
-		}
-		header.SetMode(0600)
-		writer, err := archive.CreateHeader(header)
-		if err != nil {
-			return err
-		}
-		if _, err := io.WriteString(writer, note.Content); err != nil {
-			return err
-		}
-	}
 	for _, file := range files {
 		header := &zip.FileHeader{
 			Name:     file.meta.ArchivePath,
@@ -223,7 +213,92 @@ func (a *App) ExportBackup(destination io.Writer) error {
 			return closeErr
 		}
 	}
+
+	// The manifest is written last by streaming each note body again. Zip
+	// entries cannot be interleaved, and avoiding a temporary copy keeps the
+	// export self-contained in the data directory.
+	manifestWriter, err := archive.CreateHeader(&zip.FileHeader{
+		Name:     "manifest.json",
+		Method:   zip.Deflate,
+		Modified: time.Now(),
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(manifestWriter, `{"format":`); err != nil {
+		return err
+	}
+	if err := writeJSONValue(manifestWriter, backupFormat); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(manifestWriter, `,"version":%d,"created_at":`, backupVersion); err != nil {
+		return err
+	}
+	if err := writeJSONValue(manifestWriter, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(manifestWriter, `,"notes":[`); err != nil {
+		return err
+	}
+	rows, err = tx.Query(`SELECT rowid, title, COALESCE(content, ''), COALESCE(folder, ''),
+		COALESCE(tags, ''), version, created_at, updated_at FROM notes ORDER BY rowid`)
+	if err != nil {
+		return err
+	}
+	first := true
+	for rows.Next() {
+		var note backupNote
+		var tags string
+		if err := rows.Scan(&note.ID, &note.Title, &note.Content, &note.Folder,
+			&tags, &note.Version, &note.CreatedAt, &note.UpdatedAt); err != nil {
+			rows.Close()
+			return err
+		}
+		note.Tags = splitTags(tags)
+		if !first {
+			if _, err := io.WriteString(manifestWriter, ","); err != nil {
+				rows.Close()
+				return err
+			}
+		}
+		first = false
+		if err := writeJSONValue(manifestWriter, note); err != nil {
+			rows.Close()
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(manifestWriter, `],"folders":`); err != nil {
+		return err
+	}
+	if err := writeJSONValue(manifestWriter, folders); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(manifestWriter, `,"attachments":`); err != nil {
+		return err
+	}
+	if err := writeJSONValue(manifestWriter, attachments); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(manifestWriter, `}`); err != nil {
+		return err
+	}
 	return archive.Close()
+}
+
+func writeJSONValue(writer io.Writer, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = writer.Write(data)
+	return err
 }
 
 // sanitizeBackupSegment turns note titles and folder names into portable zip
@@ -305,7 +380,14 @@ func validBackupArchivePath(name string) bool {
 // validation happens before the database and attachment directory are touched,
 // so a malformed archive leaves the current data intact.
 func (a *App) RestoreBackup(data []byte) (int, int, error) {
-	manifest, files, err := readBackupArchive(data)
+	return a.RestoreBackupReader(bytes.NewReader(data), int64(len(data)))
+}
+
+// RestoreBackupReader is the streaming entry point used by the HTTP handler.
+// It receives a file-backed ReaderAt so a large archive is never held entirely
+// in memory.
+func (a *App) RestoreBackupReader(reader io.ReaderAt, size int64) (int, int, error) {
+	manifest, files, err := readBackupArchive(reader, size)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -360,21 +442,22 @@ func (a *App) RestoreBackup(data []byte) (int, int, error) {
 	}
 	committed = true
 	cleanupAttachments()
+	a.markDataChanged()
 	a.notifyChange()
 	return len(manifest.Notes), len(manifest.Attachments), nil
 }
 
-func readBackupArchive(data []byte) (backupManifest, map[string]*zip.File, error) {
-	if len(data) > maxBackupUpload {
+func readBackupArchive(reader io.ReaderAt, size int64) (backupManifest, map[string]*zip.File, error) {
+	if size > maxBackupUpload {
 		return backupManifest{}, nil, fmt.Errorf("%w: archive exceeds the %d MiB limit",
 			errInvalidBackup, maxBackupUpload>>20)
 	}
-	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	archive, err := zip.NewReader(reader, size)
 	if err != nil {
 		return backupManifest{}, nil, fmt.Errorf("%w: %v", errInvalidBackup, err)
 	}
-	files := make(map[string]*zip.File, len(reader.File))
-	for _, file := range reader.File {
+	files := make(map[string]*zip.File, len(archive.File))
+	for _, file := range archive.File {
 		if _, exists := files[file.Name]; exists {
 			return backupManifest{}, nil, fmt.Errorf("%w: duplicate entry %q", errInvalidBackup, file.Name)
 		}
@@ -601,7 +684,10 @@ func swapAttachmentsDir(current, staged string) (func(), func(), error) {
 }
 
 func insertRestoredNotes(tx *sql.Tx, notes []backupNote) error {
-	for _, note := range notes {
+	for index, note := range notes {
+		if index > 0 && index%1000 == 0 {
+			log.Printf("restore: inserted %d of %d notes", index, len(notes))
+		}
 		createdAt := strings.TrimSpace(note.CreatedAt)
 		updatedAt := strings.TrimSpace(note.UpdatedAt)
 		if _, err := tx.Exec(`INSERT INTO notes(rowid, title, content, folder, tags, version, created_at, updated_at)
@@ -614,12 +700,18 @@ func insertRestoredNotes(tx *sql.Tx, notes []backupNote) error {
 		if err := replaceNoteLinks(tx, note.ID, note.Content); err != nil {
 			return err
 		}
+		if err := syncNoteMetadata(tx, note.ID, note.Content, note.Tags); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func insertRestoredAttachments(tx *sql.Tx, attachments []backupAttachment) error {
-	for _, attachment := range attachments {
+	for index, attachment := range attachments {
+		if index > 0 && index%1000 == 0 {
+			log.Printf("restore: inserted %d of %d attachments", index, len(attachments))
+		}
 		createdAt := strings.TrimSpace(attachment.CreatedAt)
 		if _, err := tx.Exec(`INSERT INTO attachments(id, note_id, filename, storage_name, media_type, size, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')))`,
@@ -670,8 +762,19 @@ func (a *App) handleBackup(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		a.backupMu.Lock()
 		defer a.backupMu.Unlock()
-		r.Body = http.MaxBytesReader(w, r.Body, maxBackupUpload)
-		data, err := io.ReadAll(r.Body)
+		// Spool the upload to a file next to the data so the archive is not
+		// kept in memory (it can reach 512 MiB). zip.NewReader only needs an
+		// io.ReaderAt, so the restore can read it back with normal seeks.
+		temp, err := os.CreateTemp(filepath.Dir(a.attachmentsDir), ".restore-upload-*")
+		if err != nil {
+			log.Printf("create restore upload: %v", err)
+			http.Error(w, "failed to read backup archive", http.StatusInternalServerError)
+			return
+		}
+		tempName := temp.Name()
+		defer os.Remove(tempName)
+		defer temp.Close()
+		size, err := io.Copy(temp, http.MaxBytesReader(w, r.Body, maxBackupUpload))
 		if err != nil {
 			var maxBytesError *http.MaxBytesError
 			if errors.As(err, &maxBytesError) {
@@ -681,7 +784,7 @@ func (a *App) handleBackup(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		notes, attachments, err := a.RestoreBackup(data)
+		notes, attachments, err := a.RestoreBackupReader(temp, size)
 		if errors.Is(err, errInvalidBackup) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return

@@ -21,6 +21,7 @@ const (
 	maxTaskMarkers      = 20
 	maxTaskMarkerLength = 32
 	maxTaskTextRunes    = 240
+	maxTaskResults      = 5000
 	taskMarkersKey      = "task_markers"
 )
 
@@ -41,9 +42,12 @@ type NoteTask struct {
 }
 
 type TaskList struct {
-	Items   []NoteTask `json:"items"`
-	Total   int        `json:"total"`
-	Markers []string   `json:"markers"`
+	Items     []NoteTask `json:"items"`
+	Total     int        `json:"total"`
+	Markers   []string   `json:"markers"`
+	Limit     int        `json:"limit,omitempty"`
+	Offset    int        `json:"offset,omitempty"`
+	Truncated bool       `json:"truncated,omitempty"`
 }
 
 type taskMatch struct {
@@ -90,7 +94,7 @@ func ParseTaskMarkers(raw string) ([]string, error) {
 // until someone saves a custom list in the settings panel.
 func (a *App) TaskMarkers() ([]string, error) {
 	var raw string
-	err := a.db.QueryRow("SELECT value FROM app_settings WHERE key = ?", taskMarkersKey).Scan(&raw)
+	err := a.readDB.QueryRow("SELECT value FROM app_settings WHERE key = ?", taskMarkersKey).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return append([]string(nil), DefaultTaskMarkers...), nil
 	}
@@ -148,15 +152,57 @@ func (a *App) handleTaskMarkers(w http.ResponseWriter, r *http.Request) {
 // requested markers. Notes keep the most recently updated order so the panel
 // shows fresh material first.
 func (a *App) ListTasks(markers []string) (TaskList, error) {
-	rows, err := a.db.Query(`SELECT rowid, title, COALESCE(folder, ''), COALESCE(content, ''), updated_at
+	return a.listTasks(markers, maxTaskResults, 0)
+}
+
+func (a *App) listTasks(markers []string, limit, offset int) (TaskList, error) {
+	if limit < 1 {
+		limit = maxTaskResults
+	}
+	if limit > maxTaskResults {
+		limit = maxTaskResults
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	revision := a.currentDataRevision()
+	cacheKey := strings.Join(markers, "\x00") + fmt.Sprintf("|%d|%d", limit, offset)
+	a.cacheMu.Lock()
+	for _, entry := range a.taskCache {
+		if entry.revision == revision && entry.key == cacheKey {
+			list := entry.list
+			a.cacheMu.Unlock()
+			return list, nil
+		}
+	}
+	a.cacheMu.Unlock()
+
+	patterns := compileTaskPatterns(markers)
+	items := make([]NoteTask, 0, min(limit, 32))
+	if len(patterns) == 0 {
+		return TaskList{Items: items, Total: 0, Markers: markers, Limit: limit, Offset: offset}, nil
+	}
+
+	// A cheap substring pre-filter avoids copying the full content of notes
+	// that cannot contain any marker. extractTasks still applies the word
+	// boundary rules, so the result is identical.
+	conditions := make([]string, 0, len(patterns))
+	arguments := make([]any, 0, len(patterns))
+	for _, pattern := range patterns {
+		conditions = append(conditions, "instr(COALESCE(content, ''), ?) > 0")
+		arguments = append(arguments, pattern.marker)
+	}
+	query := `SELECT rowid, title, COALESCE(folder, ''), COALESCE(content, ''), updated_at
 		FROM notes
-		ORDER BY updated_at DESC, rowid DESC`)
+		WHERE ` + strings.Join(conditions, " OR ") + `
+		ORDER BY updated_at DESC, rowid DESC`
+	rows, err := a.readDB.Query(query, arguments...)
 	if err != nil {
 		return TaskList{}, err
 	}
 	defer rows.Close()
 
-	items := make([]NoteTask, 0)
+	total := 0
 	for rows.Next() {
 		var (
 			id      int64
@@ -168,76 +214,130 @@ func (a *App) ListTasks(markers []string) (TaskList, error) {
 		if err := rows.Scan(&id, &title, &folder, &content, &updated); err != nil {
 			return TaskList{}, err
 		}
-		for _, match := range extractTasks(content, markers) {
-			items = append(items, NoteTask{
-				NoteID:    id,
-				NoteTitle: title,
-				Folder:    folder,
-				Marker:    match.Marker,
-				Text:      match.Text,
-				Line:      match.Line,
-				UpdatedAt: updated,
-			})
+		for _, match := range extractTasksWithPatterns(content, patterns) {
+			if total >= offset && len(items) < limit {
+				items = append(items, NoteTask{
+					NoteID:    id,
+					NoteTitle: title,
+					Folder:    folder,
+					Marker:    match.Marker,
+					Text:      match.Text,
+					Line:      match.Line,
+					UpdatedAt: updated,
+				})
+			}
+			total++
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return TaskList{}, err
 	}
-	return TaskList{Items: items, Total: len(items), Markers: markers}, nil
+	list := TaskList{
+		Items:     items,
+		Total:     total,
+		Markers:   markers,
+		Limit:     limit,
+		Offset:    offset,
+		Truncated: total > offset+len(items),
+	}
+	a.cacheMu.Lock()
+	a.taskCache = append(a.taskCache, taskPageCache{revision: revision, key: cacheKey, list: list})
+	if len(a.taskCache) > 12 {
+		a.taskCache = a.taskCache[len(a.taskCache)-12:]
+	}
+	a.cacheMu.Unlock()
+	return list, nil
+}
+
+type taskPageCache struct {
+	revision uint64
+	key      string
+	list     TaskList
+}
+
+type taskPattern struct {
+	marker string
+}
+
+func compileTaskPatterns(markers []string) []taskPattern {
+	patterns := make([]taskPattern, 0, len(markers))
+	for _, marker := range markers {
+		if marker == "" {
+			continue
+		}
+		patterns = append(patterns, taskPattern{marker: marker})
+	}
+	return patterns
 }
 
 func extractTasks(content string, markers []string) []taskMatch {
-	if len(markers) == 0 {
+	return extractTasksWithPatterns(content, compileTaskPatterns(markers))
+}
+
+func extractTasksWithPatterns(content string, patterns []taskPattern) []taskMatch {
+	if len(patterns) == 0 {
 		return nil
-	}
-	patterns := make([]*regexp.Regexp, 0, len(markers))
-	for _, marker := range markers {
-		patterns = append(patterns, regexp.MustCompile(regexp.QuoteMeta(marker)))
 	}
 
 	lines := strings.Split(content, "\n")
 	start := bodyStartLine(lines)
 	matches := make([]taskMatch, 0)
 	for index := start; index < len(lines); index++ {
-		line := lines[index]
-		type hit struct {
-			start  int
-			end    int
-			marker string
-		}
-		hits := make([]hit, 0, 1)
-		for markerIndex, pattern := range patterns {
-			for _, location := range pattern.FindAllStringIndex(line, -1) {
-				begin, end := location[0], location[1]
-				if !taskBoundaryBefore(line, begin) || !taskBoundaryAfter(line, end) {
-					continue
-				}
-				hits = append(hits, hit{start: begin, end: end, marker: markers[markerIndex]})
+		matches = append(matches, extractTasksFromLine(lines[index], index+1, patterns)...)
+	}
+	return matches
+}
+
+func extractTasksFromLine(line string, lineNumber int, patterns []taskPattern) []taskMatch {
+	type hit struct {
+		start  int
+		end    int
+		marker string
+	}
+	var hitBuffer [4]hit
+	hits := hitBuffer[:0]
+	for _, pattern := range patterns {
+		// Scan with strings.Index instead of a regular expression. The
+		// marker is a literal word, and this path runs for every candidate
+		// line whenever the task panel is refreshed.
+		for offset := 0; offset < len(line); {
+			relative := strings.Index(line[offset:], pattern.marker)
+			if relative < 0 {
+				break
 			}
+			begin := offset + relative
+			end := begin + len(pattern.marker)
+			if taskBoundaryBefore(line, begin) && taskBoundaryAfter(line, end) {
+				hits = append(hits, hit{start: begin, end: end, marker: pattern.marker})
+			}
+			offset = end
 		}
-		if len(hits) == 0 {
-			continue
-		}
-		// Prefer the longest marker when two configured words start at the
-		// same byte, and never report overlapping hits from one line.
+	}
+	if len(hits) == 0 {
+		return nil
+	}
+	// Prefer the longest marker when two configured words start at the same
+	// byte, and never report overlapping hits from one line.
+	if len(hits) > 1 {
 		sort.SliceStable(hits, func(i, j int) bool {
 			if hits[i].start != hits[j].start {
 				return hits[i].start < hits[j].start
 			}
 			return hits[i].end > hits[j].end
 		})
-		lastEnd := -1
-		for _, match := range hits {
-			if match.start < lastEnd {
-				continue
-			}
-			lastEnd = match.end
-			matches = append(matches, taskMatch{
-				Marker: match.marker,
-				Text:   taskText(line[match.end:]),
-				Line:   index + 1,
-			})
+	}
+	matches := make([]taskMatch, 0, len(hits))
+	lastEnd := -1
+	for _, match := range hits {
+		if match.start < lastEnd {
+			continue
 		}
+		lastEnd = match.end
+		matches = append(matches, taskMatch{
+			Marker: match.marker,
+			Text:   taskText(line[match.end:]),
+			Line:   lineNumber,
+		})
 	}
 	return matches
 }

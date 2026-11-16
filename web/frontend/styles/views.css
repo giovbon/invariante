@@ -365,6 +365,11 @@
         cursor: grabbing;
     }
 
+    .graph-loading {
+        fill: var(--muted);
+        font-size: var(--text-md);
+    }
+
     .graph-edge {
         stroke: var(--graph-link);
         stroke-opacity: .55;
@@ -1178,7 +1183,11 @@
     }
 
     .table-card {
+        display: flex;
+        height: calc(100vh - 264px);
+        min-height: 360px;
         overflow: hidden;
+        flex-direction: column;
         border: 1px solid var(--border);
         border-radius: var(--radius-xl);
         background: color-mix(in srgb, var(--surface) 92%, transparent);
@@ -1187,9 +1196,28 @@
 
     .notes-table-host {
         position: relative;
+        flex: 1 1 auto;
         width: 100%;
-        height: calc(100vh - 264px);
-        min-height: 320px;
+        height: auto;
+        min-height: 0;
+    }
+
+    .table-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 14px;
+        border-top: 1px solid var(--border);
+    }
+
+    .table-footer[hidden] {
+        display: none;
+    }
+
+    .table-footer-status {
+        color: var(--faint);
+        font-size: var(--text-xs);
     }
 
     .table-columns {
@@ -1729,6 +1757,7 @@
 
         .table-card {
             display: flex;
+            height: auto;
             min-height: 0;
             flex: 1;
             flex-direction: column;

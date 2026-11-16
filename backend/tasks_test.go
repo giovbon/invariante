@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -31,7 +32,7 @@ func TestExtractTasksFindsMarkersOutsideFrontmatter(t *testing.T) {
 }
 
 func TestParseTaskMarkersNormalizesAndRejectsInvalidValues(t *testing.T) {
-	markers, err := ParseTaskMarkers("todo, FIXME: ; bug bug TODO")
+	markers, err := ParseTaskMarkers("TODO, FIXME: ; BUG BUG TODO")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +51,9 @@ func TestParseTaskMarkersNormalizesAndRejectsInvalidValues(t *testing.T) {
 	}
 	if _, err := ParseTaskMarkers("TODO:!,FIXME"); err == nil {
 		t.Fatal("invalid marker should be rejected")
+	}
+	if _, err := ParseTaskMarkers("todo,FIXME"); err == nil {
+		t.Fatal("lowercase marker should be rejected")
 	}
 }
 
@@ -122,7 +126,7 @@ func TestTaskMarkerSettingsPersistAndFeedTasks(t *testing.T) {
 		t.Fatalf("unexpected default markers: %#v", defaultPayload)
 	}
 
-	body := strings.NewReader(`{"markers":["todo","LATER"]}`)
+	body := strings.NewReader(`{"markers":["TODO","LATER"]}`)
 	save := httptest.NewRequest(http.MethodPut, "/api/task-markers", body)
 	saveResponse := httptest.NewRecorder()
 	handler.ServeHTTP(saveResponse, save)
@@ -176,5 +180,40 @@ func TestTaskMarkerSettingsPersistAndFeedTasks(t *testing.T) {
 	}
 	if len(markers) != 2 || markers[1] != "LATER" {
 		t.Fatalf("markers did not survive reopening: %#v", markers)
+	}
+}
+
+func TestTasksEndpointPaginates(t *testing.T) {
+	app, err := NewApp(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	var content strings.Builder
+	for index := 1; index <= 5; index++ {
+		content.WriteString("TODO: tarefa " + strconv.Itoa(index) + "\n")
+	}
+	if _, err := app.CreateNote(Note{Title: "Muitas", Content: content.String()}); err != nil {
+		t.Fatal(err)
+	}
+	handler := app.Handler(filepath.Join("..", "web", "frontend"))
+	request := httptest.NewRequest(http.MethodGet, "/api/tasks?markers=TODO&limit=2&offset=2", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("tasks status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload TaskList
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Total != 5 || len(payload.Items) != 2 || payload.Limit != 2 || payload.Offset != 2 {
+		t.Fatalf("pagination = %#v", payload)
+	}
+	if payload.Items[0].Text != "tarefa 3" || payload.Items[1].Text != "tarefa 4" {
+		t.Fatalf("unexpected page: %#v", payload.Items)
+	}
+	if !payload.Truncated {
+		t.Fatal("expected truncated flag for remaining tasks")
 	}
 }

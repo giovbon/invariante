@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -101,5 +102,32 @@ Corpo`,
 	}
 	if item.Attachments[0].URL == "" {
 		t.Fatalf("attachment URL is empty")
+	}
+}
+
+func TestTableEndpointPaginates(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Handler(filepath.Join("..", "web", "frontend"))
+	for index := 1; index <= 5; index++ {
+		if _, err := app.CreateNote(Note{Title: "Nota " + strconv.Itoa(index), Content: "corpo"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	response := performJSONRequest(t, handler, http.MethodGet, "/api/table?limit=2&offset=2", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	payload := decodeResponse[struct {
+		Items     []TableNote `json:"items"`
+		Total     int         `json:"total"`
+		Limit     int         `json:"limit"`
+		Offset    int         `json:"offset"`
+		Truncated bool        `json:"truncated"`
+	}](t, response)
+	if payload.Total != 5 || len(payload.Items) != 2 || payload.Limit != 2 || payload.Offset != 2 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if !payload.Truncated {
+		t.Fatal("expected truncated flag")
 	}
 }

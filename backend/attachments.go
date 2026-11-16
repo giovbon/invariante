@@ -61,10 +61,10 @@ func cleanAttachmentFilename(filename string) (string, error) {
 
 func (a *App) ListAttachments(noteID int64) ([]Attachment, error) {
 	var exists int
-	if err := a.db.QueryRow("SELECT 1 FROM notes WHERE rowid = ?", noteID).Scan(&exists); err != nil {
+	if err := a.readDB.QueryRow("SELECT 1 FROM notes WHERE rowid = ?", noteID).Scan(&exists); err != nil {
 		return nil, err
 	}
-	rows, err := a.db.Query(`SELECT id, note_id, filename, media_type, size, created_at
+	rows, err := a.readDB.Query(`SELECT id, note_id, filename, media_type, size, created_at
 		FROM attachments WHERE note_id = ? ORDER BY created_at, id`, noteID)
 	if err != nil {
 		return nil, err
@@ -145,6 +145,7 @@ func (a *App) SaveAttachment(noteID int64, source io.Reader, originalFilename st
 	if err := tx.Commit(); err != nil {
 		return Attachment{}, removeAttachmentFile(destination, fmt.Errorf("commit attachment metadata: %w", err))
 	}
+	a.markDataChanged()
 	return Attachment{
 		ID: id, NoteID: noteID, Filename: filename, MediaType: mediaType,
 		Size: size, URL: attachmentURL(noteID, id),
@@ -161,7 +162,7 @@ func removeAttachmentFile(filePath string, cause error) error {
 func (a *App) GetAttachment(noteID, attachmentID int64) (Attachment, string, error) {
 	var item Attachment
 	var storageName string
-	err := a.db.QueryRow(`SELECT id, note_id, filename, storage_name, media_type, size, created_at
+	err := a.readDB.QueryRow(`SELECT id, note_id, filename, storage_name, media_type, size, created_at
 		FROM attachments WHERE note_id = ? AND id = ?`, noteID, attachmentID).
 		Scan(&item.ID, &item.NoteID, &item.Filename, &storageName, &item.MediaType, &item.Size, &item.CreatedAt)
 	if err != nil {
@@ -193,6 +194,7 @@ func (a *App) DeleteAttachment(noteID, attachmentID int64) error {
 	if err := os.Remove(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("attachment metadata deleted but file cleanup failed: %w", err)
 	}
+	a.markDataChanged()
 	return nil
 }
 
@@ -250,21 +252,26 @@ func (a *App) handleAttachments(w http.ResponseWriter, r *http.Request, noteID i
 func (a *App) handleAttachment(w http.ResponseWriter, r *http.Request, noteID, attachmentID int64) {
 	switch r.Method {
 	case http.MethodGet:
+		// Resolve the file and open it under the read lock so a concurrent
+		// restore (which swaps the attachments directory) cannot hand us a
+		// path from the old database and a directory from the new one. The
+		// lock is released before streaming: an open file survives the swap.
+		a.dataMu.RLock()
 		item, filePath, err := a.GetAttachment(noteID, attachmentID)
+		var file *os.File
+		if err == nil {
+			file, err = os.Open(filePath)
+		}
+		a.dataMu.RUnlock()
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
 			return
 		}
 		if err != nil {
-			logAttachmentError(w, "load attachment", err)
-			return
-		}
-		file, err := os.Open(filePath)
-		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				http.NotFound(w, r)
 			} else {
-				logAttachmentError(w, "open attachment", err)
+				logAttachmentError(w, "load attachment", err)
 			}
 			return
 		}

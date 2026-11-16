@@ -60,23 +60,28 @@ export function indentSelection(value, start, end, outdent = false) {
     });
 }
 
+const maxHistoryEntries = 200;
+const maxHistoryChars = 16 * 1024 * 1024;
+
 export class MarkdownEditor {
     constructor(textarea, onChange, onHistoryChange = () => {}) {
         this.textarea = textarea;
         this.onChange = onChange;
         this.onHistoryChange = onHistoryChange;
         this.history = [textarea.value];
+        this.historyChars = textarea.value.length;
         this.historyIndex = 0;
         this.lastInputAt = 0;
     }
 
-    setValue(value) {
+    setValue(value, { silent = false } = {}) {
         this.textarea.value = value;
         this.history = [value];
+        this.historyChars = value.length;
         this.historyIndex = 0;
         this.lastInputAt = 0;
         this.notifyHistory();
-        this.onChange(value);
+        if (!silent) this.onChange(value);
     }
 
     handleInput() {
@@ -84,19 +89,19 @@ export class MarkdownEditor {
         if (this.history[this.historyIndex] !== value) {
             const now = Date.now();
             if (this.historyIndex < this.history.length - 1) {
-                this.history = this.history.slice(0, this.historyIndex + 1);
+                this.dropFutureHistory();
             }
             if (now - this.lastInputAt < 500 && this.historyIndex > 0) {
+                const previous = this.history[this.historyIndex];
+                this.historyChars += value.length - previous.length;
                 this.history[this.historyIndex] = value;
             } else {
                 this.history.push(value);
+                this.historyChars += value.length;
                 this.historyIndex++;
             }
-            if (this.history.length > 200) {
-                this.history.shift();
-                this.historyIndex--;
-            }
             this.lastInputAt = now;
+            this.trimHistory();
         }
         this.notifyHistory();
         this.onChange(value);
@@ -135,14 +140,12 @@ export class MarkdownEditor {
         this.textarea.value = result.value;
         this.textarea.focus();
         this.textarea.setSelectionRange(result.start, result.end);
-        this.history = this.history.slice(0, this.historyIndex + 1);
+        this.dropFutureHistory();
         this.history.push(result.value);
+        this.historyChars += result.value.length;
         this.historyIndex++;
-        if (this.history.length > 200) {
-            this.history.shift();
-            this.historyIndex--;
-        }
         this.lastInputAt = 0;
+        this.trimHistory();
         this.notifyHistory();
         this.onChange(result.value);
     }
@@ -286,6 +289,22 @@ export class MarkdownEditor {
             });
         }
         return true;
+    }
+
+    dropFutureHistory() {
+        for (let index = this.historyIndex + 1; index < this.history.length; index++) {
+            this.historyChars -= this.history[index].length;
+        }
+        this.history = this.history.slice(0, this.historyIndex + 1);
+    }
+
+    trimHistory() {
+        while (this.history.length > maxHistoryEntries ||
+            (this.historyChars > maxHistoryChars && this.history.length > 1 && this.historyIndex > 0)) {
+            const removed = this.history.shift();
+            this.historyChars -= removed.length;
+            this.historyIndex = Math.max(0, this.historyIndex - 1);
+        }
     }
 
     undo() {

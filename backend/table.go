@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -21,34 +23,82 @@ type TableNote struct {
 	Attachments []Attachment   `json:"attachments"`
 }
 
-// ListTableNotes returns every note matching the folder/tag filters with its
-// parsed frontmatter and attachments. The table view is intentionally not
-// paginated: the frontend filters and pages the data locally.
-func (a *App) ListTableNotes(folder, tag string) ([]TableNote, error) {
-	rows, err := a.db.Query(`SELECT rowid, title, folder, COALESCE(tags, ''),
-		COALESCE(content, ''), created_at, updated_at
+// The table view is local and interactive, but an unbounded response would
+// copy the whole library over the wire. The cap keeps the payload bounded;
+// the handler reports the real total so the UI can warn about truncation.
+const maxTableNotes = 5000
+
+// ListTableNotes returns the notes matching the filters with parsed
+// frontmatter and attachments, up to the default page size. Callers that page
+// through the table use listTableNotes directly.
+func (a *App) ListTableNotes(folder, tag string) ([]TableNote, int, error) {
+	return a.listTableNotes(folder, tag, maxTableNotes, 0)
+}
+
+func (a *App) listTableNotes(folder, tag string, limit, offset int) ([]TableNote, int, error) {
+	if limit < 1 {
+		limit = maxTableNotes
+	}
+	if limit > maxTableNotes {
+		limit = maxTableNotes
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	revision := a.currentDataRevision()
+	cacheable := limit <= 1000
+	cacheKey := fmt.Sprintf("%s\x00%s|%d|%d", folder, tag, limit, offset)
+	if cacheable {
+		a.cacheMu.Lock()
+		for _, entry := range a.tableCache {
+			if entry.revision == revision && entry.key == cacheKey {
+				items, total := entry.items, entry.total
+				a.cacheMu.Unlock()
+				return items, total, nil
+			}
+		}
+		a.cacheMu.Unlock()
+	}
+	var total int
+	if err := a.readDB.QueryRow(`SELECT COUNT(*) FROM notes
+		WHERE (folder = ? OR ? = '')
+		AND (? = '' OR EXISTS (
+			SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?
+		))`, folder, folder, tag, tag).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := a.readDB.Query(`SELECT rowid, title, folder, COALESCE(tags, ''),
+		COALESCE(frontmatter, '{}'), created_at, updated_at
 		FROM notes
 		WHERE (folder = ? OR ? = '')
-		AND (? = '' OR instr(',' || lower(COALESCE(tags, '')) || ',', ',' || lower(?) || ',') > 0)
-		ORDER BY updated_at DESC, rowid DESC`,
-		folder, folder, tag, tag)
+		AND (? = '' OR EXISTS (
+			SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?
+		))
+		ORDER BY updated_at DESC, rowid DESC LIMIT ? OFFSET ?`,
+		folder, folder, tag, tag, limit, offset)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 
-	items := make([]TableNote, 0)
+	items := make([]TableNote, 0, min(limit, 64))
 	noteIDs := make(map[int64]int)
 	for rows.Next() {
 		var item TableNote
 		var tags string
-		var content string
-		if err := rows.Scan(&item.ID, &item.Title, &item.Folder, &tags, &content,
+		var frontmatter string
+		if err := rows.Scan(&item.ID, &item.Title, &item.Folder, &tags, &frontmatter,
 			&item.CreatedAt, &item.UpdatedAt); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		item.Tags = splitTags(tags)
-		item.Properties = frontmatterProperties(content)
+		properties := make(map[string]any)
+		if frontmatter != "" {
+			if err := json.Unmarshal([]byte(frontmatter), &properties); err != nil {
+				properties = make(map[string]any)
+			}
+		}
+		item.Properties = properties
 		if len(item.Tags) > 0 {
 			item.Properties["tags"] = item.Tags
 		}
@@ -57,35 +107,77 @@ func (a *App) ListTableNotes(folder, tag string) ([]TableNote, error) {
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if len(items) == 0 {
-		return items, nil
+		if cacheable {
+			a.cacheTablePage(revision, cacheKey, items, total)
+		}
+		return items, total, nil
 	}
 
-	attachmentRows, err := a.db.Query(`SELECT id, note_id, filename, media_type, size, created_at
-		FROM attachments ORDER BY note_id, created_at, id`)
-	if err != nil {
-		return nil, err
+	// Fetch attachments only for the notes on this page. The 500-note chunk
+	// stays below SQLite's default bound-parameter limit.
+	ids := make([]int64, 0, len(noteIDs))
+	for id := range noteIDs {
+		ids = append(ids, id)
 	}
-	defer attachmentRows.Close()
-	for attachmentRows.Next() {
-		var item Attachment
-		if err := attachmentRows.Scan(&item.ID, &item.NoteID, &item.Filename,
-			&item.MediaType, &item.Size, &item.CreatedAt); err != nil {
-			return nil, err
+	const attachmentChunk = 500
+	for start := 0; start < len(ids); start += attachmentChunk {
+		end := min(start+attachmentChunk, len(ids))
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", end-start), ",")
+		arguments := make([]any, 0, end-start)
+		for _, id := range ids[start:end] {
+			arguments = append(arguments, id)
 		}
-		position, ok := noteIDs[item.NoteID]
-		if !ok {
-			continue
+		attachmentRows, err := a.readDB.Query(`SELECT id, note_id, filename, media_type, size, created_at
+			FROM attachments WHERE note_id IN (`+placeholders+`) ORDER BY note_id, created_at, id`,
+			arguments...)
+		if err != nil {
+			return nil, 0, err
 		}
-		item.URL = attachmentURL(item.NoteID, item.ID)
-		items[position].Attachments = append(items[position].Attachments, item)
+		for attachmentRows.Next() {
+			var item Attachment
+			if err := attachmentRows.Scan(&item.ID, &item.NoteID, &item.Filename,
+				&item.MediaType, &item.Size, &item.CreatedAt); err != nil {
+				attachmentRows.Close()
+				return nil, 0, err
+			}
+			position, ok := noteIDs[item.NoteID]
+			if !ok {
+				continue
+			}
+			item.URL = attachmentURL(item.NoteID, item.ID)
+			items[position].Attachments = append(items[position].Attachments, item)
+		}
+		if err := attachmentRows.Err(); err != nil {
+			attachmentRows.Close()
+			return nil, 0, err
+		}
+		if err := attachmentRows.Close(); err != nil {
+			return nil, 0, err
+		}
 	}
-	if err := attachmentRows.Err(); err != nil {
-		return nil, err
+	if cacheable {
+		a.cacheTablePage(revision, cacheKey, items, total)
 	}
-	return items, nil
+	return items, total, nil
+}
+
+func (a *App) cacheTablePage(revision uint64, key string, items []TableNote, total int) {
+	a.cacheMu.Lock()
+	a.tableCache = append(a.tableCache, tablePageCache{revision: revision, key: key, items: items, total: total})
+	if len(a.tableCache) > 8 {
+		a.tableCache = a.tableCache[len(a.tableCache)-8:]
+	}
+	a.cacheMu.Unlock()
+}
+
+type tablePageCache struct {
+	revision uint64
+	key      string
+	items    []TableNote
+	total    int
 }
 
 // frontmatterProperties parses the top-level YAML keys between the leading
@@ -93,6 +185,9 @@ func (a *App) ListTableNotes(folder, tag string) ([]TableNote, error) {
 // nested mappings and block scalars, which covers the metadata used by notes.
 func frontmatterProperties(content string) map[string]any {
 	properties := make(map[string]any)
+	if !hasFrontmatter(content) {
+		return properties
+	}
 	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
 	if len(lines) < 3 || strings.TrimSpace(lines[0]) != "---" {
 		return properties
@@ -412,11 +507,29 @@ func (a *App) handleTable(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	items, err := a.ListTableNotes(r.URL.Query().Get("folder"), r.URL.Query().Get("tag"))
+	limit := maxTableNotes
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 1 && parsed <= maxTableNotes {
+			limit = parsed
+		}
+	}
+	offset := 0
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
+	items, total, err := a.listTableNotes(r.URL.Query().Get("folder"), r.URL.Query().Get("tag"), limit, offset)
 	if err != nil {
 		log.Printf("list table notes: %v", err)
 		http.Error(w, "failed to list table notes", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":     items,
+		"total":     total,
+		"limit":     limit,
+		"offset":    offset,
+		"truncated": offset+len(items) < total,
+	})
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -191,7 +192,14 @@ func NewNtfyMonitor(app *App, config NtfyConfig) (*NtfyMonitor, error) {
 	streamURL.RawQuery = ""
 	streamURL.Fragment = ""
 
+	transport := http.DefaultTransport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		cloned := base.Clone()
+		cloned.ResponseHeaderTimeout = 30 * time.Second
+		transport = cloned
+	}
 	client := &http.Client{
+		Transport: transport,
 		CheckRedirect: func(request *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return errors.New("too many redirects")
@@ -232,9 +240,15 @@ func parseNtfyServerURL(raw string) (*url.URL, error) {
 func (m *NtfyMonitor) Run(ctx context.Context) error {
 	backoff := time.Second
 	for {
+		startedAt := time.Now()
 		err := m.listen(ctx)
 		if ctx.Err() != nil {
 			return nil
+		}
+		// A connection that stayed healthy for a while should not inherit the
+		// maximum backoff from an earlier outage.
+		if time.Since(startedAt) >= time.Minute {
+			backoff = time.Second
 		}
 		log.Printf("ntfy monitor for topic %q disconnected: %v; reconnecting in %s",
 			m.config.Topic, err, backoff)
@@ -288,7 +302,7 @@ func (m *NtfyMonitor) listen(ctx context.Context) error {
 			return nil
 		}
 		line := scanner.Bytes()
-		if len(strings.TrimSpace(string(line))) == 0 {
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var event ntfyEvent

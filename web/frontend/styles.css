@@ -1,8 +1,0 @@
-/* Legacy entry point kept for compatibility.
-   index.html now loads the layered stylesheets directly:
-   /styles/tokens.css, /styles/base.css, /styles/components.css and /styles/views.css. */
-
-@import url("/styles/tokens.css");
-@import url("/styles/base.css");
-@import url("/styles/components.css");
-@import url("/styles/views.css");

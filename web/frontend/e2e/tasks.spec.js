@@ -93,3 +93,23 @@ test('opens a task at the marker in reading mode', async ({ page, request }) => 
     await expect.poll(() => page.locator('#markdownPreview').evaluate(element => element.scrollTop))
         .toBeGreaterThan(0);
 });
+
+test('loads additional task pages on demand', async ({ page, request }) => {
+    const marker = 'PAGEMARK';
+    const save = await request.put('/api/task-markers', { data: { markers: [marker] } });
+    expect(save.ok()).toBeTruthy();
+    try {
+        const content = Array.from({ length: 300 }, (_, index) => `${marker}: tarefa ${index + 1}`).join('\n');
+        await createNote(request, { title: uniqueTitle('Paginação de tarefas'), content });
+        await page.goto('/');
+        await page.locator('#tasksButton').click();
+        const items = page.locator('#workspacePanel .task-item');
+        await expect(items).toHaveCount(250);
+        const more = page.locator('#workspacePanel .tasks-more');
+        await expect(more).toContainText('Carregar mais (50)');
+        await more.click();
+        await expect(items).toHaveCount(300);
+    } finally {
+        await request.put('/api/task-markers', { data: { markers: ['TODO', 'FIXME', 'HACK', 'XXX', 'BUG', 'NOTE'] } });
+    }
+});

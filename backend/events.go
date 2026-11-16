@@ -65,6 +65,16 @@ func (a *App) currentRevision() uint64 {
 	return a.eventsSeq
 }
 
+// closeEvents releases the event streams so a graceful shutdown does not wait
+// for the server timeout while browser tabs keep their SSE connections open.
+func (a *App) closeEvents() {
+	a.shutdownOnce.Do(func() {
+		if a.shutdown != nil {
+			close(a.shutdown)
+		}
+	})
+}
+
 func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -95,6 +105,8 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		select {
+		case <-a.shutdown:
+			return
 		case <-r.Context().Done():
 			return
 		case <-heartbeat.C:

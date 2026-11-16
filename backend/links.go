@@ -145,12 +145,71 @@ func escapeMarkdownLinkLabel(value string) string {
 	return replacer.Replace(value)
 }
 
-func (a *App) NoteGraph() (NoteGraph, error) {
+type noteLinkIndex struct {
+	revision uint64
+	notes    []indexedNote
+	byPath   map[string]int64
+	byTitle  map[string]int64
+}
+
+type noteGraphCache struct {
+	revision uint64
+	graph    NoteGraph
+}
+
+// noteIndex returns the current note list together with its link lookup maps.
+// The result is cached by data revision because the preview endpoint needs the
+// maps for every keystroke and rebuilding them scanned the whole notes table.
+func (a *App) noteIndex() (*noteLinkIndex, error) {
+	revision := a.currentDataRevision()
+	a.cacheMu.RLock()
+	cached := a.linkIndex
+	a.cacheMu.RUnlock()
+	if cached != nil && cached.revision == revision {
+		return cached, nil
+	}
 	notes, err := a.readNotesForLinks()
+	if err != nil {
+		return nil, err
+	}
+	byPath, byTitle := makeNoteLinkIndexes(notes)
+	index := &noteLinkIndex{
+		revision: revision,
+		notes:    notes,
+		byPath:   byPath,
+		byTitle:  byTitle,
+	}
+	a.cacheMu.Lock()
+	a.linkIndex = index
+	a.cacheMu.Unlock()
+	return index, nil
+}
+
+func (a *App) NoteGraph() (NoteGraph, error) {
+	revision := a.currentDataRevision()
+	a.cacheMu.RLock()
+	cached := a.graphCache
+	a.cacheMu.RUnlock()
+	if cached != nil && cached.revision == revision {
+		return cached.graph, nil
+	}
+	graph, err := a.buildNoteGraph()
 	if err != nil {
 		return NoteGraph{}, err
 	}
-	byPath, byTitle := makeNoteLinkIndexes(notes)
+	a.cacheMu.Lock()
+	a.graphCache = &noteGraphCache{revision: revision, graph: graph}
+	a.cacheMu.Unlock()
+	return graph, nil
+}
+
+func (a *App) buildNoteGraph() (NoteGraph, error) {
+	index, err := a.noteIndex()
+	if err != nil {
+		return NoteGraph{}, err
+	}
+	notes := index.notes
+	byPath, byTitle := index.byPath, index.byTitle
 	graph := NoteGraph{
 		Nodes: make([]GraphNode, 0, len(notes)),
 		Edges: make([]GraphEdge, 0),
@@ -162,7 +221,7 @@ func (a *App) NoteGraph() (NoteGraph, error) {
 	}
 	seenEdges := make(map[[3]int64]struct{})
 	connectedNotes := make(map[int64]struct{})
-	rows, err := a.db.Query(`SELECT source_id, target_key, kind
+	rows, err := a.readDB.Query(`SELECT source_id, target_key, kind
 		FROM note_links ORDER BY source_id, target_key, kind`)
 	if err != nil {
 		return NoteGraph{}, err
@@ -216,24 +275,50 @@ func (a *App) NoteGraph() (NoteGraph, error) {
 
 func (a *App) Backlinks(noteID int64) ([]NoteSummary, error) {
 	var exists int
-	if err := a.db.QueryRow("SELECT 1 FROM notes WHERE rowid = ?", noteID).Scan(&exists); err != nil {
+	if err := a.readDB.QueryRow("SELECT 1 FROM notes WHERE rowid = ?", noteID).Scan(&exists); err != nil {
 		return nil, err
 	}
-	graph, err := a.NoteGraph()
+	index, err := a.noteIndex()
+	if err != nil {
+		return nil, err
+	}
+	notesByID := make(map[int64]indexedNote, len(index.notes))
+	for _, note := range index.notes {
+		notesByID[note.ID] = note
+	}
+	rows, err := a.readDB.Query(`SELECT source_id, target_key FROM note_links
+		WHERE source_id != ? ORDER BY source_id, target_key`, noteID)
 	if err != nil {
 		return nil, err
 	}
 	backlinkIDs := make([]int64, 0)
 	seenIDs := make(map[int64]struct{})
-	for _, edge := range graph.Edges {
-		if edge.Target != noteID {
+	for rows.Next() {
+		var sourceID int64
+		var targetKey string
+		if err := rows.Scan(&sourceID, &targetKey); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if _, found := seenIDs[sourceID]; found {
 			continue
 		}
-		if _, found := seenIDs[edge.Source]; found {
+		source, exists := notesByID[sourceID]
+		if !exists {
 			continue
 		}
-		seenIDs[edge.Source] = struct{}{}
-		backlinkIDs = append(backlinkIDs, edge.Source)
+		if resolveNoteLink(source, targetKey, index.byPath, index.byTitle) != noteID {
+			continue
+		}
+		seenIDs[sourceID] = struct{}{}
+		backlinkIDs = append(backlinkIDs, sourceID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
 	}
 	if len(backlinkIDs) == 0 {
 		return []NoteSummary{}, nil
@@ -254,7 +339,7 @@ func (a *App) Backlinks(noteID int64) ([]NoteSummary, error) {
 		for index, id := range chunk {
 			arguments[index] = id
 		}
-		rows, err := a.db.Query(`SELECT rowid, title, folder, substr(COALESCE(content, ''), 1, 180),
+		rows, err := a.readDB.Query(`SELECT rowid, title, folder, substr(COALESCE(content, ''), 1, 180),
 			updated_at, COALESCE(tags, '') FROM notes WHERE rowid IN (`+placeholders+`)`,
 			arguments...)
 		if err != nil {
@@ -282,7 +367,7 @@ type noteQueryer interface {
 }
 
 func (a *App) readNotesForLinks() ([]indexedNote, error) {
-	return readNotesForLinksWith(a.db)
+	return readNotesForLinksWith(a.readDB)
 }
 
 func readNotesForLinksWith(queryer noteQueryer) ([]indexedNote, error) {
@@ -318,9 +403,62 @@ func makeNoteLinkIndexes(notes []indexedNote) (map[string]int64, map[string]int6
 	return byPath, byTitle
 }
 
+// cloneIndexedNotes copies the slice so a move can derive the "after" state
+// without mutating the cached index shared by other readers.
+func cloneIndexedNotes(notes []indexedNote) []indexedNote {
+	cloned := make([]indexedNote, len(notes))
+	copy(cloned, notes)
+	return cloned
+}
+
+func notesWithFolder(notes []indexedNote, id int64, title, folder string) []indexedNote {
+	updated := cloneIndexedNotes(notes)
+	for index := range updated {
+		if updated[index].ID == id {
+			updated[index].Title = title
+			updated[index].Folder = folder
+			break
+		}
+	}
+	return updated
+}
+
+func notesAfterFolderMove(notes []indexedNote, source, destination string) []indexedNote {
+	updated := cloneIndexedNotes(notes)
+	for index := range updated {
+		folder := updated[index].Folder
+		if folder == source || strings.HasPrefix(folder, source+"/") {
+			updated[index].Folder = destination + strings.TrimPrefix(folder, source)
+		}
+	}
+	return updated
+}
+
+func notesAfterFolderDelete(notes []indexedNote, folder string) []indexedNote {
+	updated := cloneIndexedNotes(notes)
+	for index := range updated {
+		current := updated[index].Folder
+		if current == folder || strings.HasPrefix(current, folder+"/") {
+			updated[index].Folder = ""
+		}
+	}
+	return updated
+}
+
+func indexedNoteByID(notes []indexedNote, id int64) (indexedNote, bool) {
+	for _, note := range notes {
+		if note.ID == id {
+			return note, true
+		}
+	}
+	return indexedNote{}, false
+}
+
+var linkMarkdown = goldmark.New()
+
 func extractNoteLinks(content string) ([]linkTarget, error) {
 	source := []byte(content)
-	document := goldmark.New().Parser().Parse(text.NewReader(source))
+	document := linkMarkdown.Parser().Parse(text.NewReader(source))
 	targets := make([]linkTarget, 0)
 	if err := ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
 		if entering {

@@ -40,6 +40,23 @@ test('formats a selection and supports undo/redo', () => {
     assert.deepEqual(changes, ['**hello**', 'hello', '**hello**']);
 });
 
+test('caps undo history for very large documents', () => {
+    const block = 'x'.repeat(1_000_000);
+    const textarea = createTextarea(block);
+    const editor = new MarkdownEditor(textarea, () => {});
+    for (let index = 0; index < 25; index++) {
+        textarea.value = `${block}${index}`;
+        editor.lastInputAt = 0;
+        editor.handleInput();
+    }
+    assert.ok(editor.historyChars <= 16 * 1024 * 1024);
+    assert.ok(editor.history.length <= 20);
+    assert.equal(editor.history[editor.historyIndex], textarea.value);
+    assert.ok(editor.historyIndex > 0);
+    editor.undo();
+    assert.notEqual(textarea.value, `${block}24`);
+});
+
 test('continues ordered lists with the next number', () => {
     const textarea = createTextarea('1. first', 8);
     const editor = new MarkdownEditor(textarea, () => {});
@@ -260,7 +277,7 @@ test('highlights configured task markers as standalone words', () => {
     );
     assert.equal(
         highlightMarkdown('todo: revisar', ['todo']),
-        '<span class="md-task-marker" data-marker="TODO">todo</span>: revisar'
+        'todo: revisar'
     );
     assert.equal(highlightMarkdown('TODOLIST', ['TODO']), 'TODOLIST');
     assert.equal(

@@ -223,9 +223,13 @@ func (a *authenticator) isRateLimited(ip string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now()
+	for address, failure := range a.failures {
+		if !failure.expires.After(now) {
+			delete(a.failures, address)
+		}
+	}
 	failure, found := a.failures[ip]
-	if !found || !failure.expires.After(now) {
-		delete(a.failures, ip)
+	if !found {
 		return false
 	}
 	return failure.count >= authFailureLimit
