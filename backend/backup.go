@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	// Kept stable across the Invariante rebrand so existing backup archives
+	// Kept stable across the TON-618 rebrand so existing backup archives
 	// remain importable.
 	backupFormat        = "pkm-notes-backup"
 	backupVersion       = 1
@@ -755,7 +755,7 @@ func (a *App) handleBackup(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to create backup", http.StatusInternalServerError)
 			return
 		}
-		filename := "invariante-" + time.Now().UTC().Format("20060102-150405") + ".zip"
+		filename := "ton618-" + time.Now().UTC().Format("20060102-150405") + ".zip"
 		w.Header().Set("Content-Type", "application/zip")
 		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
 		http.ServeContent(w, r, filename, info.ModTime(), temp)

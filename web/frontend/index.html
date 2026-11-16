@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="">
-    <title>Invariante</title>
+    <title>TON-618</title>
     <link rel="icon" href="/assets/brand/favicon.svg" type="image/svg+xml">
     <script src="/src/theme-init.js"></script>
     <link rel="preload" href="/vendor/inter/InterVariable.woff2" as="font" type="font/woff2" crossorigin>
@@ -18,7 +18,7 @@
 </head>
 <body class="panel-open">
     <aside class="activity-rail" aria-label="Navegação principal">
-        <button class="brand-mark" id="homeButton" type="button" aria-label="Invariante — mostrar todas as notas" title="Invariante — todas as notas">
+        <button class="brand-mark" id="homeButton" type="button" aria-label="TON-618 — mostrar todas as notas" title="TON-618 — todas as notas">
             <img src="/assets/brand/logo-mark.svg" alt="">
         </button>
         <button class="rail-button is-active" type="button" data-panel="files" aria-label="Abrir pastas" title="Pastas">
@@ -61,7 +61,7 @@
         <header class="topbar">
             <div class="topbar-title">
                 <span class="brand-icon" aria-hidden="true"><img src="/assets/brand/logo-mark.svg" alt=""></span>
-                <h1>Invariante</h1>
+                <h1>TON-618</h1>
                 <span class="breadcrumb" id="currentFolder">Todas as notas</span>
                 <span class="editor-breadcrumb-separator" aria-hidden="true">/</span>
                 <label class="sr-only" for="noteTitle">Título da nota</label>
@@ -70,6 +70,9 @@
             <div class="topbar-actions">
                 <button class="icon-button command-trigger" id="commandButton" type="button" aria-label="Abrir paleta de comandos" aria-keyshortcuts="Control+K Meta+K" title="Paleta de comandos (Ctrl+K)">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+                </button>
+                <button class="icon-button" id="helpButton" type="button" aria-label="Abrir ajuda" aria-haspopup="dialog" aria-controls="helpDialog" aria-expanded="false" title="Ajuda">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.6 9.4a2.5 2.5 0 0 1 4.9.8c0 1.6-2.3 1.9-2.3 3.4"/><circle cx="12.2" cy="17.2" r=".9" fill="currentColor" stroke="none"/></svg>
                 </button>
                 <input id="markdownImportInput" type="file" accept=".md,text/markdown" multiple hidden>
                 <button class="button" data-variant="muted" id="logoutButton" type="button" hidden>Sair</button>
@@ -218,6 +221,13 @@
                 <button class="button" data-variant="primary" id="addAttachment" type="button">Enviar arquivos</button>
                 <input id="attachmentInput" type="file" multiple hidden>
             </div>
+        </dialog>
+        <dialog id="helpDialog" class="help-dialog" aria-labelledby="helpTitle">
+            <header class="help-dialog-header">
+                <h2 id="helpTitle">Ajuda</h2>
+                <button class="icon-button" id="closeHelp" type="button" aria-label="Fechar ajuda">×</button>
+            </header>
+            <article id="helpContent" class="markdown-preview help-content" aria-live="polite"></article>
         </dialog>
         <dialog id="commandPalette" class="command-palette" aria-label="Paleta de comandos">
             <h2 class="sr-only">Paleta de comandos</h2>

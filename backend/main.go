@@ -1557,6 +1557,7 @@ func (a *App) Handler(frontendDir string) http.Handler {
 	mux.HandleFunc("/api/table", a.handleTable)
 	mux.HandleFunc("/api/graph", a.handleGraph)
 	mux.HandleFunc("/api/preview", a.handlePreview)
+	mux.HandleFunc("/api/help", a.handleHelp(frontendDir))
 	mux.Handle("/", publicFrontendFiles(staticFiles(frontendDir)))
 	return requestLogger(a.auth.middleware(gzipResponses(mux)))
 }
@@ -2201,7 +2202,7 @@ func main() {
 			log.Printf("HTTP shutdown: %v", err)
 		}
 	}()
-	log.Printf("Invariante listening on http://localhost:%d", portNumber)
+	log.Printf("TON-618 listening on http://localhost:%d", portNumber)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("serve application: %v", err)
 	}

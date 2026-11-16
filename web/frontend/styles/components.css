@@ -1766,6 +1766,58 @@
         cursor: pointer;
     }
 
+    /* ---------- Help dialog ---------- */
+
+    .help-dialog {
+        position: fixed;
+        inset: 0;
+        width: min(760px, calc(100vw - 32px));
+        max-width: calc(100vw - 32px);
+        max-height: min(82vh, 760px);
+        margin: auto;
+        padding: 0;
+        overflow: hidden;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-xl);
+        color: var(--text);
+        background: var(--surface);
+        box-shadow: var(--shadow-lg);
+    }
+
+    .help-dialog[open] {
+        display: flex;
+        flex-direction: column;
+        animation: dialog-in var(--duration-normal) var(--ease-standard);
+    }
+
+    .help-dialog::backdrop {
+        background: var(--overlay);
+        backdrop-filter: blur(3px);
+        animation: backdrop-in var(--duration-fast) var(--ease-standard);
+    }
+
+    .help-dialog-header {
+        display: flex;
+        flex: 0 0 auto;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 18px;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .help-dialog-header h2 {
+        margin: 0;
+        font-size: var(--text-lg);
+    }
+
+    .help-dialog .help-content {
+        min-height: 0;
+        flex: 1 1 auto;
+        padding: 6px 18px 20px;
+        overscroll-behavior: contain;
+    }
+
     /* ---------- Command palette ---------- */
 
     .command-palette {

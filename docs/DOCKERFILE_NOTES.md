@@ -1,11 +1,11 @@
-# Docker para Invariante
+# Docker para TON-618
 
-Este diretório contém os arquivos de configuração Docker para construir, rodar e distribuir o Invariante.
+Este diretório contém os arquivos de configuração Docker para construir, rodar e distribuir o TON-618.
 
 ## Arquivos
 
 ### 1. Dockerfile
-Um Dockerfile multi-estágio para construir a aplicação Invariante:
+Um Dockerfile multi-estágio para construir a aplicação TON-618:
 
 - **Estágio 1 (Builder)**: Compila o binário Go usando a imagem `golang:1.27-alpine`
   - Suporta múltiplas arquiteturas (amd64, arm64)
@@ -102,10 +102,10 @@ docker push giovbon/tektite:latest
 
 ## Sincronização com Projeto de Referência (basalt)
 
-Este Dockerfile é baseado no projeto reference basalt, com adaptações específicas para o Invariante:
+Este Dockerfile é baseado no projeto reference basalt, com adaptações específicas para o TON-618:
 
 - Adaptou nome do binário (`invariante-backend` vs `basalt`)
 - Atualizou importações Go e dependências (`github.com/mattn/go-sqlite3`, `github.com/yuin/goldmark`)
 - Configurou rotas de API diferentes
-- Adicionou scripts específicos para o Invariante (`run.sh`)
+- Adicionou scripts específicos para o TON-618 (`run.sh`)
 - Adaptou configurações de frontend (`./web/frontend` vs `./web`)

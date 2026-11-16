@@ -1880,7 +1880,7 @@
             height: 60px;
             flex-direction: row;
             justify-content: center;
-            gap: clamp(2px, 1vw, 8px);
+            gap: 0;
             padding: 6px;
             border-top: 1px solid var(--border);
             border-right: 0;
@@ -1895,9 +1895,18 @@
             display: none;
         }
 
+        /* Botões da barra inferior ~1/3 maiores; encolhem apenas em telas
+           muito estreitas para não estourar a largura. */
         .rail-button {
-            width: 34px;
-            height: 34px;
+            width: 45px;
+            height: 45px;
+            flex: 0 1 auto;
+        }
+
+        .rail-button svg,
+        .rail-button#settingsButton svg {
+            width: 23px;
+            height: 23px;
         }
 
         .rail-button.is-active {

@@ -54,6 +54,8 @@ WORKDIR /app
 COPY --from=builder /invariante-backend /app/invariante-backend
 # O backend serve a UI a partir de ./web/frontend (relativo ao WORKDIR).
 COPY --from=builder /src/web/frontend /app/web/frontend
+# Ajuda exibida pelo botão da barra superior; lida da raiz do projeto.
+COPY --from=builder /src/HELP.md /app/HELP.md
 
 # Configurar permissões
 RUN chmod +x /app/invariante-backend && \

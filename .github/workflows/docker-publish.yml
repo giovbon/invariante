@@ -20,7 +20,7 @@ env:
   # O namespace da imagem PRECISA ser o mesmo da conta dona do DOCKERHUB_TOKEN.
   # Usar o secret evita o erro "insufficient_scope" causado por publicar em um
   # namespace diferente do usuário autenticado (ex.: giovoni x giovbon).
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/invariante
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ton618
 
 jobs:
   build-and-push:

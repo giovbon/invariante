@@ -1,6 +1,6 @@
-# Docker Setup for Invariante
+# Docker Setup for TON-618
 
-Este documento explica como construir, rodar e distribuir a aplicação Invariante usando Docker.
+Este documento explica como construir, rodar e distribuir a aplicação TON-618 usando Docker.
 
 ## Arquivos Criados
 
@@ -32,7 +32,7 @@ Script de automação para Docker Hub:
 ```bash
 #!/bin/bash
 
-# Script de automação para construir e pushar a imagem Invariante para Docker Hub
+# Script de automação para construir e pushar a imagem TON-618 para Docker Hub
 # Suporta múltiplas arquiteturas, especialmente arm64 (ARM 64-bit)
 
 # Construir para amd64 e arm64, push para Docker Hub
@@ -152,7 +152,7 @@ CGO_ENABLED=1 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 
 Este setup é baseado no projeto basalt com adaptações:
 
-| Característica | Basalt | Invariante |
+| Característica | Basalt | TON-618 |
 |---------------|--------|-----------|
 | Nome do Binário | `basalt` | `invariante-backend` |
 | Pacote Principal | `./cmd/basalt` | `./backend` |
@@ -244,8 +244,8 @@ Se você estiver migrando do basalt:
 
 ### Arquivos Chave para Manter
 
-- `Dockerfile` (adaptado para o Invariante)
-- `docker-compose.yml` (adaptado para o Invariante)
+- `Dockerfile` (adaptado para o TON-618)
+- `docker-compose.yml` (adaptado para o TON-618)
 - `build-and-push.sh` (novo script de automação)
 - `.github/workflows/docker-publish.yml` (novo workflow)
 
@@ -284,4 +284,4 @@ Use basalt como referência, adapte para seu projeto. GitHub Actions workflow é
 
 ## Agradecimentos
 
-Baseado no excelente projeto reference [basalt](https://github.com/giovbon/basalt) com adaptações para o Invariante.
+Baseado no excelente projeto reference [basalt](https://github.com/giovbon/basalt) com adaptações para o TON-618.

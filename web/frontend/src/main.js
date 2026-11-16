@@ -123,6 +123,9 @@ const elements = {
     noteContentHighlight: document.querySelector('#noteContentHighlight'),
     markdownPreview: document.querySelector('#markdownPreview'),
     wikilinkAutocomplete: document.querySelector('#wikilinkAutocomplete'),
+    helpDialog: document.querySelector('#helpDialog'),
+    helpButton: document.querySelector('#helpButton'),
+    helpContent: document.querySelector('#helpContent'),
     attachmentsDialog: document.querySelector('#attachmentsDialog'),
     attachmentsButton: document.querySelector('#attachmentsButton'),
     attachmentInput: document.querySelector('#attachmentInput'),
@@ -421,6 +424,14 @@ function setupEventListeners() {
     document.querySelector('#graphSearch').addEventListener('input', event => graphView.setSearch(event.target.value));
     elements.newNote.addEventListener('click', () => openNewNote());
     document.querySelector('#commandButton').addEventListener('click', () => void commandPalette.open());
+    elements.helpButton.addEventListener('click', () => void openHelp());
+    document.querySelector('#closeHelp').addEventListener('click', () => elements.helpDialog.close());
+    elements.helpDialog.addEventListener('close', () => {
+        elements.helpButton.setAttribute('aria-expanded', 'false');
+    });
+    elements.helpDialog.addEventListener('click', event => {
+        if (event.target === elements.helpDialog) elements.helpDialog.close();
+    });
     document.querySelector('#markdownImportInput').addEventListener('change', event => {
         const files = [...event.target.files];
         event.target.value = '';
@@ -646,6 +657,9 @@ function setupEventListeners() {
         }
     });
     document.addEventListener('keydown', event => {
+        // The help dialog is modal and handles Escape natively; do not let the
+        // global shortcuts run behind it.
+        if (elements.helpDialog.open) return;
         if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'k') {
             if (event.defaultPrevented) return;
             event.preventDefault();
@@ -1081,7 +1095,7 @@ async function exportBackup(button = document.querySelector('#exportBackup')) {
         const blob = await response.blob();
         const disposition = response.headers.get('Content-Disposition') || '';
         const match = /filename="?([^";]+)"?/i.exec(disposition);
-        const filename = match ? match[1] : `invariante-${new Date().toISOString().slice(0, 10)}.zip`;
+        const filename = match ? match[1] : `ton618-${new Date().toISOString().slice(0, 10)}.zip`;
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
@@ -1557,6 +1571,46 @@ function showEditor(note) {
 function updateEditorBreadcrumb() {
     elements.currentFolder.textContent = state.noteFolder || 'Sem pasta';
     elements.noteTitle.title = elements.noteTitle.value || 'Título da nota';
+}
+
+// HELP.md is rendered on the server so the dialog follows the same Markdown
+// pipeline (and security rules) as note previews.
+let helpRequestID = 0;
+
+async function openHelp() {
+    const dialog = elements.helpDialog;
+    if (!dialog.open) {
+        dialog.showModal();
+        elements.helpButton.setAttribute('aria-expanded', 'true');
+    }
+    const requestID = ++helpRequestID;
+    if (!elements.helpContent.childElementCount) {
+        elements.helpContent.textContent = 'Carregando ajuda…';
+    }
+    elements.helpContent.setAttribute('aria-busy', 'true');
+    try {
+        const response = await fetch('/api/help');
+        if (response.status === 401) {
+            location.replace('/login.html');
+            return;
+        }
+        if (!response.ok) throw new Error((await response.text()).trim() || `HTTP ${response.status}`);
+        const html = await response.text();
+        if (requestID !== helpRequestID) return;
+        elements.helpContent.innerHTML = html;
+        for (const link of elements.helpContent.querySelectorAll('a[href]')) {
+            if (/^https?:/i.test(link.href)) {
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+            }
+        }
+    } catch (error) {
+        if (requestID === helpRequestID) {
+            elements.helpContent.textContent = `Não foi possível carregar a ajuda: ${error.message}`;
+        }
+    } finally {
+        if (requestID === helpRequestID) elements.helpContent.removeAttribute('aria-busy');
+    }
 }
 
 // Moving a note or folder can rewrite links in the note that is currently

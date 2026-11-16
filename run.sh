@@ -15,7 +15,7 @@ Usage: ./run.sh [--data-dir PATH] [--port PORT]
   AUTHENTICATION_COOKIE_SECURE=true.
   --help      Show this help
 
-An existing Invariante process listening on the selected port is stopped before
+An existing TON-618 process listening on the selected port is stopped before
 the server starts. Other applications are left running; use a different port.
 EOF
 }
@@ -102,13 +102,13 @@ stop_existing_invariante() {
         fi
         if ! is_invariante_process "$pid"; then
             echo "Error: port $PORT is occupied by another process (PID $pid); leaving it running." >&2
-            echo "Stop that process yourself or start Invariante on another port with --port." >&2
+            echo "Stop that process yourself or start TON-618 on another port with --port." >&2
             return 1
         fi
     done
 
     for pid in "${pids[@]}"; do
-        echo "Stopping existing Invariante process (PID $pid) on port $PORT..."
+        echo "Stopping existing TON-618 process (PID $pid) on port $PORT..."
         kill -TERM "$pid" 2>/dev/null || true
     done
 
@@ -120,7 +120,7 @@ stop_existing_invariante() {
 
     for pid in "${pids[@]}"; do
         if is_invariante_process "$pid"; then
-            echo "Invariante process (PID $pid) did not stop; forcing it to exit."
+            echo "TON-618 process (PID $pid) did not stop; forcing it to exit."
             kill -KILL "$pid" 2>/dev/null || true
         else
             echo "Error: port $PORT is still occupied by another process; leaving it running." >&2
@@ -130,7 +130,7 @@ stop_existing_invariante() {
     sleep 0.2
     mapfile -t pids < <(find_listener_pids | sort -u)
     if ((${#pids[@]})); then
-        echo "Error: port $PORT is still occupied; cannot safely start Invariante." >&2
+        echo "Error: port $PORT is still occupied; cannot safely start TON-618." >&2
         return 1
     fi
 }
@@ -143,9 +143,9 @@ fi
 stop_existing_invariante
 
 cd "$SCRIPT_DIR"
-echo "Building Invariante with SQLite FTS5..."
+echo "Building TON-618 with SQLite FTS5..."
 go build -tags sqlite_fts5 -o "$SCRIPT_DIR/invariante-backend" ./backend
 
-echo "Starting Invariante at http://localhost:$PORT"
+echo "Starting TON-618 at http://localhost:$PORT"
 echo "Data directory: $DATA_DIR"
 exec "$SCRIPT_DIR/invariante-backend" --data-dir "$DATA_DIR" --port "$PORT"

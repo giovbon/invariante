@@ -1,9 +1,9 @@
-# Invariante
+# TON-618
 
 <p>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="web/frontend/assets/brand/logo-lockup-dark.svg">
-    <img src="web/frontend/assets/brand/logo-lockup-light.svg" alt="Invariante" width="256">
+    <img src="web/frontend/assets/brand/logo-lockup-light.svg" alt="TON-618" width="256">
   </picture>
 </p>
 
@@ -101,7 +101,7 @@ duplica notas. Na primeira execução, o histórico anterior do tópico é ignor
 apenas mensagens novas são capturadas. As credenciais `NTFY_*` também podem ser
 definidas no `docker-compose.yml`.
 
-Antes de iniciar, o script verifica a porta escolhida e encerra uma instância anterior do Invariante que esteja escutando nela. Processos de outros aplicativos não são encerrados; nesse caso, escolha outra porta ou encerre o processo manualmente. A verificação requer `lsof` ou `fuser`.
+Antes de iniciar, o script verifica a porta escolhida e encerra uma instância anterior do TON-618 que esteja escutando nela. Processos de outros aplicativos não são encerrados; nesse caso, escolha outra porta ou encerre o processo manualmente. A verificação requer `lsof` ou `fuser`.
 
 Para ARM64, compile nativamente no dispositivo ou configure um compilador C cruzado para o alvo. Como SQLite usa `cgo`, `GOARCH=arm64` isoladamente não produz um binário executável com o driver.
 
@@ -126,6 +126,7 @@ Para ARM64, compile nativamente no dispositivo ou configure um compilador C cruz
 - Interface adaptada para desktop e mobile; tema claro/escuro.
 - Design system em CSS puro, sem etapa de build: tokens em `web/frontend/styles/tokens.css`, base em `base.css`, componentes reutilizáveis em `components.css` e layouts de tela em `views.css`. Os temas claro e escuro, foco, movimento reduzido, tipografia e cores de sintaxe são derivados dos mesmos tokens.
 - Paleta de comandos com `Ctrl/Cmd+K` para criar notas, navegar entre telas, alternar o tema, exportar backups e abrir notas por busca instantânea. A paleta também pode ser aberta pelo botão de busca na barra superior.
+- O botão de ajuda na barra superior abre um diálogo com o conteúdo de `HELP.md`, na raiz do projeto, renderizado com o mesmo pipeline Markdown das notas. Editar o arquivo e reabrir o diálogo já mostra a versão nova.
 - Captura via ntfy: mensagens de um tópico viram notas na pasta **Inbox**, com anexos, tags e título automático extraído das palavras mais representativas do texto e do nome dos arquivos. A configuração é feita por variáveis `NTFY_*` (veja **Captura via ntfy**).
 
 O preview usa Goldmark no backend. HTML bruto é mantido inativo e destinos com esquemas inseguros em links/imagens são neutralizados.
@@ -194,6 +195,7 @@ Ao anexar um arquivo pelo editor, uma imagem raster compatível é inserida como
 - `GET` e `POST /api/notes/{id}/attachments`; `GET` e `DELETE /api/notes/{id}/attachments/{attachment_id}` (upload multipart no campo `file`)
 - `GET /api/auth/status`, `POST /api/auth/login` e `POST /api/auth/logout`
 - `POST /api/preview` com o corpo Markdown em texto simples
+- `GET /api/help` com o conteúdo de `HELP.md` renderizado em HTML
 - `GET /api/health`
 
 Listagens aceitam limites de 1 a 100 registros e filtram por tag exata, sem diferenciar maiúsculas de minúsculas. Títulos aceitam até 256 caracteres, conteúdo até 5 MiB e caminhos de pasta devem ser relativos. Uploads aceitam um arquivo de até 25 MiB; são enviados como `multipart/form-data` usando o campo `file`. Links para anexos são servidos como download; imagens raster podem ser exibidas inline com `?inline=1`.
