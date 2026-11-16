@@ -51,8 +51,14 @@ export function splitWikilinkQuery(query) {
 
 export function indentSelection(value, start, end, outdent = false) {
     if (start === end && !outdent) {
-        const next = `${value.slice(0, start)}    ${value.slice(end)}`;
-        return { value: next, start: start + 4, end: start + 4 };
+        const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+        // Só insere espaços soltos quando o cursor está na indentação inicial da linha.
+        // Em qualquer outro ponto indentamos a linha inteira, para que marcadores de
+        // lista (ex.: "- item") se movam junto com o conteúdo.
+        if (/^[ \t]*$/.test(value.slice(lineStart, start))) {
+            const next = `${value.slice(0, start)}    ${value.slice(end)}`;
+            return { value: next, start: start + 4, end: start + 4 };
+        }
     }
     return changeLines(value, start, end, line => {
         if (!outdent) return `    ${line}`;
@@ -226,8 +232,12 @@ export class MarkdownEditor {
             return;
         }
         const pairs = { '(': ')', '[': ']', '{': '}', '"': '"', "'": "'" };
+        const inlineMarkers = ['*', '_', '`'];
         const { selectionStart, selectionEnd, value } = this.textarea;
-        if (pairs[event.key] && selectionStart !== selectionEnd) {
+        if (selectionStart !== selectionEnd && inlineMarkers.includes(event.key)) {
+            event.preventDefault();
+            this.apply(replaceSelection(value, selectionStart, selectionEnd, event.key));
+        } else if (pairs[event.key] && selectionStart !== selectionEnd) {
             event.preventDefault();
             this.apply(replaceSelection(value, selectionStart, selectionEnd, event.key, pairs[event.key]));
         } else if (pairs[event.key] && selectionStart === selectionEnd) {

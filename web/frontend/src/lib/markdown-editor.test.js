@@ -27,6 +27,50 @@ test('outdents selected lines without removing unselected lines', () => {
     assert.equal(result.value, 'one\ntwo\nthree');
 });
 
+test('Indents the whole line when the caret is inside it', () => {
+    const result = indentSelection('- item', 6, 6);
+    assert.equal(result.value, '    - item');
+    assert.equal(result.start, 10);
+});
+
+test('keeps inserting spaces when the caret is on the leading indentation', () => {
+    const result = indentSelection('item', 0, 0);
+    assert.equal(result.value, '    item');
+    assert.equal(result.start, 4);
+});
+
+test('wraps the selection when typing a Markdown marker', () => {
+    for (const [key, expected] of [['*', '*hello*'], ['_', '_hello_'], ['`', '`hello`']]) {
+        const textarea = createTextarea('hello', 0, 5);
+        const editor = new MarkdownEditor(textarea, () => {});
+        let prevented = false;
+        editor.handleKeydown({ key, ctrlKey: false, metaKey: false, altKey: false, preventDefault() { prevented = true; } });
+        assert.equal(prevented, true);
+        assert.equal(textarea.value, expected);
+        assert.equal(textarea.value.slice(textarea.selectionStart, textarea.selectionEnd), 'hello');
+    }
+});
+
+test('wrapping twice with the same marker creates bold text', () => {
+    const textarea = createTextarea('hello', 0, 5);
+    const editor = new MarkdownEditor(textarea, () => {});
+    const event = () => ({ key: '*', ctrlKey: false, metaKey: false, altKey: false, preventDefault() {} });
+    editor.handleKeydown(event());
+    editor.handleKeydown(event());
+    assert.equal(textarea.value, '**hello**');
+});
+
+test('Tab indents the whole list item and Shift+Tab outdents it', () => {
+    const textarea = createTextarea('- item', 6);
+    const editor = new MarkdownEditor(textarea, () => {});
+    editor.handleKeydown({ key: 'Tab', shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, preventDefault() {} });
+    assert.equal(textarea.value, '    - item');
+    assert.equal(textarea.selectionStart, 10);
+    editor.handleKeydown({ key: 'Tab', shiftKey: true, ctrlKey: false, metaKey: false, altKey: false, preventDefault() {} });
+    assert.equal(textarea.value, '- item');
+    assert.equal(textarea.selectionStart, 6);
+});
+
 test('formats a selection and supports undo/redo', () => {
     const textarea = createTextarea('hello', 0, 5);
     const changes = [];
