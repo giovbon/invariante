@@ -67,6 +67,26 @@ Comentários `<!-- ton618:... -->` sozinhos na linha geram conteúdo a partir do
 
 Cada bloco aceita até 50 itens e a nota aceita até 20 blocos. `backlinks` e `links` exigem uma nota salva.
 
+### Bloco `tabela`
+
+```markdown
+<!-- ton618:tabela colunas="titulo,pasta=Projetos,tags=amigo" ordenar="prazo desc" limite=10 -->
+```
+
+| Argumento | Uso |
+| --- | --- |
+| `colunas` | colunas separadas por vírgula; padrão `titulo,atualizado` |
+| `pasta` | filtra pela pasta exata (sem precisar exibi-la) |
+| `tag` | filtra pela tag (sem precisar exibi-la) |
+| `ordenar` | campo e direção, ex.: `prazo desc`; padrão `atualizado` |
+| `limite` | número de linhas, até 50 (padrão 20) |
+
+- Colunas: `titulo`, `pasta`, `tags`, `atualizado`, `criado` ou qualquer propriedade do frontmatter (`status`, `prioridade`…).
+- Toda coluna também filtra quando recebe um valor: `colunas="titulo,pasta=Projetos,tags=amigo"` mostra essas três colunas e mantém só as notas da pasta `Projetos` com a tag `amigo`.
+- Colunas diferentes somam filtros (E); na mesma coluna, `|` separa alternativas (OU): `tags=amigo|família`.
+- `titulo` filtra por trecho do título; `atualizado` e `criado` por prefixo da data.
+- Valores com espaço vão entre aspas, inclusive aspas aninhadas: `colunas="tags="amigo",pasta="sei lá""`.
+
 ## Tarefas
 
 - O painel **Tarefas** encontra marcadores como `TODO:`, `FIXME:` e `BUG:` em todas as notas.
