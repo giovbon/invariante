@@ -1,4 +1,4 @@
-import { stripFrontmatter, frontmatterLineOffset, parseFrontmatter } from './markdown-editor.js';
+import { stripFrontmatter, frontmatterLineOffset, parseFrontmatter, isMarkmapNote } from './markdown-editor.js';
 import { estimateSourceLine, getScrollSpacerHeight, mapEditorToPreview, mapPreviewToEditor } from './scroll-sync.js';
 import { highlightCode } from './syntax-highlight.js';
 import { findLinkOccurrence, linkTargetMatches } from './note-links.js';
@@ -15,6 +15,141 @@ export function createEditorPreview({ state, elements, closePanel }) {
     let programmaticScroll = null;
     let scrollSyncSuspendedUntil = 0;
     let pendingReadingLine = null;
+    // markmap is only needed by notes that opt in through
+    // `note-type: markmap` in the frontmatter, so its ~650 KB bundle is
+    // loaded on demand and reused across notes.
+    let markmapLoader = null;
+    let markmapTimer = 0;
+    let markmapInstance = null;
+
+const markmapScripts = [
+    '/vendor/markmap/d3.min.js',
+    '/vendor/markmap/markmap-lib.min.js',
+    '/vendor/markmap/markmap-view.min.js'
+];
+
+function isMarkmapPreview() {
+    return elements.markdownPreview.classList.contains('is-markmap');
+}
+
+function loadMarkmap() {
+    if (window.markmap?.Transformer && window.markmap?.Markmap) {
+        return Promise.resolve(window.markmap);
+    }
+    if (markmapLoader) return markmapLoader;
+    markmapLoader = (async () => {
+        for (const src of markmapScripts) {
+            await new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = src;
+                script.dataset.markmapScript = src;
+                script.addEventListener('load', resolve, { once: true });
+                script.addEventListener('error', () => {
+                    reject(new Error(`Não foi possível carregar ${src}.`));
+                }, { once: true });
+                document.head.append(script);
+            });
+        }
+        if (!window.markmap?.Transformer || !window.markmap?.Markmap) {
+            throw new Error('A biblioteca do markmap não foi inicializada.');
+        }
+        return window.markmap;
+    })().catch(error => {
+        markmapLoader = null;
+        throw error;
+    });
+    return markmapLoader;
+}
+
+function destroyMarkmap() {
+    window.clearTimeout(markmapTimer);
+    markmapTimer = 0;
+    markmapInstance?.destroy?.();
+    markmapInstance = null;
+}
+
+function resetMarkmapPreview() {
+    destroyMarkmap();
+    elements.markdownPreview.classList.remove('is-markmap');
+    delete elements.markdownPreview.dataset.noteType;
+}
+
+function scheduleMarkmapPreview(markdown, requestID) {
+    elements.markdownPreview.classList.add('is-markmap');
+    elements.markdownPreview.dataset.noteType = 'markmap';
+    window.clearTimeout(markmapTimer);
+    markmapTimer = window.setTimeout(() => {
+        markmapTimer = 0;
+        void drawMarkmapPreview(markdown, requestID);
+    }, 140);
+}
+
+async function drawMarkmapPreview(markdown, requestID) {
+    try {
+        const library = await loadMarkmap();
+        if (requestID !== previewRequestID || !isMarkmapPreview()) return;
+        const preview = elements.markdownPreview;
+        destroyMarkmap();
+        preview.replaceChildren();
+        renderedPreviewMarkdown = markdown;
+        editorLinePositionCache = null;
+        pendingReadingLine = null;
+
+        if (!markdown.trim()) {
+            const empty = document.createElement('p');
+            empty.className = 'markmap-empty';
+            empty.textContent = 'Escreva a estrutura do mapa mental com títulos e listas Markdown.';
+            preview.append(empty);
+            renderFrontmatterProperties();
+            runPendingBacklink();
+            runPendingTaskLine();
+            return;
+        }
+
+        const host = document.createElement('div');
+        host.className = 'markmap-host';
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('class', 'markmap');
+        svg.setAttribute('role', 'img');
+        svg.setAttribute('aria-label', 'Mapa mental da nota');
+        host.append(svg);
+        preview.append(host);
+        renderFrontmatterProperties();
+
+        const transformer = new library.Transformer();
+        const { root } = transformer.transform(markdown);
+        // Wait one frame so the svg has its final size before markmap
+        // measures and lays out the tree.
+        await new Promise(resolve => requestAnimationFrame(resolve));
+        if (requestID !== previewRequestID || !isMarkmapPreview()) return;
+        // markmap-view always appends an inline <style> to the svg. The
+        // strict `style-src 'self'` CSP blocks it (and the base styles are
+        // already loaded from /vendor/markmap/markmap.css), so hand it an
+        // inert stand-in instead.
+        const svgSelection = window.d3.select(svg);
+        const append = svgSelection.append.bind(svgSelection);
+        const inertStyle = { text() { return this; } };
+        svgSelection.append = name => name === 'style' ? inertStyle : append(name);
+        markmapInstance = library.Markmap.create(svgSelection, library.deriveOptions({
+            colorFreezeLevel: 2,
+            duration: 200,
+            embedGlobalCSS: false
+        }), root);
+
+        if (state.pendingOutlineLine !== null) {
+            const pendingLine = state.pendingOutlineLine;
+            state.pendingOutlineLine = null;
+            requestAnimationFrame(() => scrollToOutlineHeading(pendingLine));
+        }
+        runPendingBacklink();
+        runPendingTaskLine();
+    } catch (error) {
+        if (requestID !== previewRequestID) return;
+        resetMarkmapPreview();
+        elements.markdownPreview.textContent = `Falha ao renderizar o mapa mental: ${error.message}`;
+        renderedPreviewMarkdown = '';
+    }
+}
 
 function highlightPreviewCode() {
     for (const code of elements.markdownPreview.querySelectorAll('pre > code')) {
@@ -41,7 +176,13 @@ function updatePreview() {
     }
     const requestID = ++previewRequestID;
     window.clearTimeout(previewTimer);
-    const markdown = stripFrontmatter(elements.noteContent.value);
+    const content = elements.noteContent.value;
+    const markdown = stripFrontmatter(content);
+    if (isMarkmapNote(content)) {
+        scheduleMarkmapPreview(markdown, requestID);
+        return;
+    }
+    resetMarkmapPreview();
     if (!markdown.trim()) {
         elements.markdownPreview.textContent = '';
         renderFrontmatterProperties();
@@ -198,6 +339,10 @@ function renderFrontmatterProperties() {
 
 function syncPreviewMinimumHeight() {
     const preview = elements.markdownPreview;
+    if (isMarkmapPreview()) {
+        preview.querySelector(':scope > .preview-scroll-spacer')?.remove();
+        return;
+    }
     let spacer = preview.querySelector(':scope > .preview-scroll-spacer');
     if (elements.noteContent.clientHeight === 0 || preview.clientHeight === 0) {
         spacer?.remove();
@@ -361,6 +506,7 @@ function measureEditorLines(markdown, lines) {
 }
 
 function getScrollLandmarks() {
+    if (isMarkmapPreview()) return [];
     const content = elements.noteContent.value;
     const markdown = stripFrontmatter(content);
     if (renderedPreviewMarkdown !== markdown) return [];
@@ -396,6 +542,8 @@ function getScrollLandmarks() {
 function previewAnchorSourceLine() {
     const preview = elements.markdownPreview;
     if (!preview || preview.clientHeight === 0) return null;
+    // The mind map has no source-line landmarks to map the scroll back.
+    if (isMarkmapPreview()) return null;
     const content = elements.noteContent.value;
     const offset = frontmatterLineOffset(content);
     const previewRect = preview.getBoundingClientRect();
@@ -425,6 +573,7 @@ function hasPreviewSelection() {
 
 function handleEditorScroll(source) {
     if (elements.editorWorkspace.dataset.editorMode !== 'split') return;
+    if (isMarkmapPreview()) return;
     if (source === elements.markdownPreview && hasPreviewSelection()) return;
     if (performance.now() < scrollSyncSuspendedUntil) {
         if (programmaticScroll?.element === source) programmaticScroll = null;
@@ -459,6 +608,7 @@ function handleEditorScroll(source) {
 
 function syncEditorScrollFromSource() {
     if (elements.editorWorkspace.dataset.editorMode !== 'split') return;
+    if (isMarkmapPreview()) return;
     if (hasPreviewSelection()) return;
     if (performance.now() < scrollSyncSuspendedUntil) return;
     const editor = elements.noteContent;
@@ -521,6 +671,7 @@ function setEditorMode(mode) {
 }
 
 function scrollPreviewToSourceLine(lineIndex) {
+    if (isMarkmapPreview()) return false;
     const bodyLine = Math.max(0, lineIndex - frontmatterLineOffset(elements.noteContent.value));
     const blocks = [...elements.markdownPreview.querySelectorAll('[data-source-line]')];
     let target = null;
@@ -681,6 +832,7 @@ function scrollToOutlineHeading(line) {
             previewRequestID++;
             previewAbortController?.abort();
             previewAbortController = null;
+            resetMarkmapPreview();
             renderedPreviewMarkdown = '';
             editorLinePositionCache = null;
             scrollSyncSuspendedUntil = 0;

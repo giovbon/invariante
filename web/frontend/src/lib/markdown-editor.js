@@ -572,6 +572,20 @@ export function parseFrontmatter(content) {
     return Object.keys(metadata).length ? metadata : null;
 }
 
+// Frontmatter `note-type` switches how the reading view renders the note.
+// Unknown or missing values fall back to the regular Markdown preview.
+export function noteType(content) {
+    const metadata = parseFrontmatter(content);
+    const value = metadata?.['note-type'];
+    if (value === undefined || value === null) return '';
+    const first = Array.isArray(value) ? value[0] : value;
+    return first === undefined || first === null ? '' : String(first).trim().toLowerCase();
+}
+
+export function isMarkmapNote(content) {
+    return noteType(content) === 'markmap';
+}
+
 export function extractMarkdownOutline(content) {
     const lines = content.split('\n');
     const outline = [];

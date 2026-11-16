@@ -691,6 +691,64 @@
         scrollbar-color: var(--scrollbar-thumb) transparent;
     }
 
+    /* ---------- markmap notes (frontmatter note-type: markmap) ---------- */
+    .markdown-preview.is-markmap {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 12px;
+        overflow: hidden;
+        overscroll-behavior: contain;
+    }
+
+    .markdown-preview.is-markmap .markmap-host {
+        position: relative;
+        flex: 1;
+        min-height: 0;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-xl);
+        background: color-mix(in srgb, var(--surface-raised) 55%, transparent);
+        overflow: hidden;
+    }
+
+    .markdown-preview.is-markmap .markmap {
+        display: block;
+        width: 100%;
+        height: 100%;
+        cursor: grab;
+    }
+
+    .markdown-preview.is-markmap .markmap:active {
+        cursor: grabbing;
+    }
+
+    .markdown-preview.is-markmap .markmap-empty {
+        margin: auto;
+        max-width: 28rem;
+        padding: 24px;
+        color: var(--muted);
+        text-align: center;
+    }
+
+    /* Reading mode centers prose at 42rem; the map needs the whole pane. */
+    .editor-workspace[data-editor-mode="preview"] .markdown-preview.is-markmap {
+        padding: 12px;
+    }
+
+    /* markmap defaults to a light palette; follow the app theme tokens. */
+    .markmap {
+        --markmap-text-color: var(--text);
+        --markmap-a-color: var(--accent);
+        --markmap-a-hover-color: var(--accent);
+        --markmap-code-bg: color-mix(in srgb, var(--surface) 80%, var(--border));
+        --markmap-code-color: var(--text);
+        --markmap-circle-open-bg: var(--surface);
+        --markmap-table-border: 1px solid var(--border);
+        --markmap-highlight-bg: color-mix(in srgb, var(--syntax-strong) 35%, transparent);
+        --markmap-highlight-node-bg: color-mix(in srgb, var(--accent) 18%, transparent);
+        --markmap-font: var(--text-base)/var(--leading-normal) var(--font-sans);
+    }
+
     .editor-workspace[data-editor-mode="edit"] .source-editor,
     .editor-workspace[data-editor-mode="preview"] .markdown-preview {
         width: 100%;

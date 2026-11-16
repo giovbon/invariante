@@ -1,6 +1,7 @@
 /* Third-party styles are imported into their own cascade layer so the app
    stylesheet can override Tabulator's defaults without !important rules. */
 @import url("/vendor/tabulator/tabulator_simple.min.css") layer(vendor);
+@import url("/vendor/markmap/markmap.css") layer(vendor);
 
 /* The Tabulator theme marks row backgrounds important, so its defaults must
    be overridden in the same layer to keep the app's theme colors in control. */

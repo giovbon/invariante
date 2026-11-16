@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, indentSelection, MarkdownEditor, parseFrontmatter, setFrontmatterProperty, stripFrontmatter } from './markdown-editor.js';
+import { ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, indentSelection, isMarkmapNote, MarkdownEditor, noteType, parseFrontmatter, setFrontmatterProperty, stripFrontmatter } from './markdown-editor.js';
 
 function createTextarea(value, start = 0, end = start) {
     return {
@@ -253,6 +253,22 @@ test('does not expose malformed or absent frontmatter as properties', () => {
     assert.equal(parseFrontmatter('# Note\n---\ntags: pkm'), null);
     assert.equal(parseFrontmatter('---\ntags: pkm\n# Note'), null);
     assert.equal(parseFrontmatter('---\n---\n# Note'), null);
+});
+
+test('reads the note type from frontmatter and opts into markmap', () => {
+    assert.equal(noteType('---\nnote-type: markmap\n---\n# Map'), 'markmap');
+    assert.equal(noteType('---\nnote-type: "MarkMap"\n---\n# Map'), 'markmap');
+    assert.equal(noteType('---\nnote-type:\n  - markmap\n---\n# Map'), 'markmap');
+    assert.equal(noteType('---\nnote-type: table\n---\n# Note'), 'table');
+    assert.equal(noteType('---\ntags: pkm\n---\n# Note'), '');
+    assert.equal(noteType('# Note'), '');
+});
+
+test('detects markmap notes only when note-type is markmap', () => {
+    assert.equal(isMarkmapNote('---\nnote-type: markmap\n---\n# Map'), true);
+    assert.equal(isMarkmapNote('---\nnote-type: markmapish\n---\n# Map'), false);
+    assert.equal(isMarkmapNote('---\nnote-type: markdown\n---\n# Map'), false);
+    assert.equal(isMarkmapNote('# Map'), false);
 });
 
 test('extracts nested headings, skips frontmatter and fenced code, and tracks preview lines', () => {
