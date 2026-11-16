@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -17,15 +18,14 @@ const (
 	noteBlockPrefix   = "ton618"
 	maxNoteBlocks     = 20
 	maxBlockItems     = 50
-	maxBlockArgLength = 120
+	maxBlockArgLength = 400
 )
 
 var (
-	noteBlockPattern    = regexp.MustCompile(`^[\t ]*<!--[\t ]*` + noteBlockPrefix + `:([a-z][a-z-]*)([^>\n]*)-->[\t ]*$`)
-	noteBlockArgPattern = regexp.MustCompile(`([A-Za-z][A-Za-z0-9-]*)=("[^"]*"|'[^']*'|[^\s]+)`)
-	headingLinePattern  = regexp.MustCompile(`^\s{0,3}(?:>\s*)*(#{1,6})\s+(.+?)\s*#*\s*$`)
-	headingLinkPattern  = regexp.MustCompile(`\[([^\]\n]*)\]\([^)\n]*\)`)
-	headingWikiPattern  = regexp.MustCompile(`\[\[([^\]\n|]*)(?:\|([^\]\n]*))?\]\]`)
+	noteBlockPattern   = regexp.MustCompile(`^[\t ]*<!--[\t ]*` + noteBlockPrefix + `:([a-z][a-z-]*)([^>\n]*)-->[\t ]*$`)
+	headingLinePattern = regexp.MustCompile(`^\s{0,3}(?:>\s*)*(#{1,6})\s+(.+?)\s*#*\s*$`)
+	headingLinkPattern = regexp.MustCompile(`\[([^\]\n]*)\]\([^)\n]*\)`)
+	headingWikiPattern = regexp.MustCompile(`\[\[([^\]\n|]*)(?:\|([^\]\n]*))?\]\]`)
 )
 
 var headingDecorations = strings.NewReplacer(
@@ -78,16 +78,77 @@ func adjustSourceLine(shifts []blockLineShift, line int) int {
 	return adjusted
 }
 
+// parseBlockArgs reads `chave="valor"` pairs. Valores com aspas internas são
+// aceitos (`colunas="tags="amigo",pasta="sei lá""`): a aspa só fecha o valor
+// quando o que vem depois é o fim do bloco ou outra chave.
 func parseBlockArgs(raw string) map[string]string {
 	args := make(map[string]string)
-	for _, match := range noteBlockArgPattern.FindAllStringSubmatch(raw, -1) {
-		value := strings.Trim(match[2], `"'`)
-		if len(value) > maxBlockArgLength {
+	runes := []rune(raw)
+	index := 0
+	for index < len(runes) {
+		for index < len(runes) && unicode.IsSpace(runes[index]) {
+			index++
+		}
+		start := index
+		for index < len(runes) && isArgKeyRune(runes[index]) {
+			index++
+		}
+		if start == index || index >= len(runes) || runes[index] != '=' {
+			index++
 			continue
 		}
-		args[strings.ToLower(match[1])] = value
+		key := strings.ToLower(string(runes[start:index]))
+		index++
+		var value string
+		if index < len(runes) && (runes[index] == '"' || runes[index] == '\'') {
+			quote := runes[index]
+			index++
+			start = index
+			for index < len(runes) {
+				if runes[index] == quote && isArgValueEnd(runes[index+1:]) {
+					break
+				}
+				index++
+			}
+			value = string(runes[start:index])
+			if index < len(runes) {
+				index++
+			}
+		} else {
+			start = index
+			for index < len(runes) && !unicode.IsSpace(runes[index]) {
+				index++
+			}
+			value = string(runes[start:index])
+		}
+		value = strings.TrimSpace(value)
+		if value == "" || len(value) > maxBlockArgLength {
+			continue
+		}
+		args[key] = value
 	}
 	return args
+}
+
+func isArgKeyRune(char rune) bool {
+	return unicode.IsLetter(char) || unicode.IsDigit(char) || char == '-'
+}
+
+// isArgValueEnd reports whether the text after a closing quote starts a new
+// argument (or ends the block), which is what makes nested quotes possible.
+func isArgValueEnd(rest []rune) bool {
+	index := 0
+	for index < len(rest) && unicode.IsSpace(rest[index]) {
+		index++
+	}
+	if index >= len(rest) {
+		return true
+	}
+	start := index
+	for index < len(rest) && isArgKeyRune(rest[index]) {
+		index++
+	}
+	return start < index && index < len(rest) && rest[index] == '='
 }
 
 // expandNoteBlocks replaces each dynamic block comment with generated Markdown.
@@ -333,52 +394,119 @@ func (a *App) renderLinksBlock(args map[string]string, ctx noteBlockContext) str
 	return strings.Join(lines, "\n")
 }
 
+// tableBlockColumn is one column of the generated table. When the column
+// carries values (`tags=amigo|família`) they also filter the rows, always
+// combined with AND across columns.
+type tableBlockColumn struct {
+	name   string
+	values []string
+}
+
+// parseTableBlockColumns reads `colunas` as a comma separated list where each
+// item is either a column name or `nome=valor`. The value may be quoted, so
+// folders and tags with spaces are accepted.
+func parseTableBlockColumns(raw string) []tableBlockColumn {
+	columns := make([]tableBlockColumn, 0, 5)
+	seen := make(map[string]struct{}, 5)
+	for _, spec := range splitYAMLInline(raw) {
+		name, values, _ := strings.Cut(spec, "=")
+		name = strings.TrimSpace(strings.Trim(name, `"'`))
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		column := tableBlockColumn{name: name}
+		for _, value := range strings.Split(values, "|") {
+			value = strings.TrimSpace(strings.Trim(value, `"'`))
+			if value != "" {
+				column.values = append(column.values, value)
+			}
+		}
+		columns = append(columns, column)
+	}
+	return columns
+}
+
 func (a *App) renderTableBlock(args map[string]string) string {
 	limit := intArg(args, "limite", 20, maxBlockItems)
-	folder := strings.TrimSpace(args["pasta"])
-	tag := strings.ToLower(strings.TrimSpace(args["tag"]))
-	columns := parseTableColumns(args["colunas"])
-	// A tag é comparada em Go porque a lista é gravada como "a, b, c" e o
-	// filtro precisa aceitar variações de espaço.
-	rows, err := a.readDB.Query(`SELECT rowid, title, COALESCE(folder, ''), COALESCE(tags, ''), updated_at, created_at
-		FROM notes
-		WHERE (? = '' OR LOWER(COALESCE(folder, '')) = LOWER(?))
-		ORDER BY updated_at DESC, rowid DESC LIMIT ?`, folder, folder, min(maxTaskResults, limit*10))
+	columns := parseTableBlockColumns(args["colunas"])
+	if len(columns) == 0 {
+		columns = []tableBlockColumn{{name: "titulo"}, {name: "atualizado"}}
+	}
+	conditions := make([]string, 0, 4)
+	arguments := make([]any, 0, 8)
+	if folder := strings.TrimSpace(args["pasta"]); folder != "" {
+		conditions = append(conditions, folderFilter())
+		arguments = append(arguments, folder)
+	}
+	if tag := strings.TrimSpace(args["tag"]); tag != "" {
+		conditions = append(conditions, tagFilter())
+		arguments = append(arguments, tag)
+	}
+	for _, column := range columns {
+		condition, values := columnFilter(column)
+		if condition == "" {
+			continue
+		}
+		conditions = append(conditions, condition)
+		arguments = append(arguments, values...)
+	}
+	order := "updated_at DESC, rowid DESC"
+	if raw := strings.TrimSpace(args["ordenar"]); raw != "" {
+		name, direction := parseOrderArgument(raw)
+		var orderArguments []any
+		order, orderArguments = tableOrderClause(name, direction, arguments)
+		arguments = orderArguments
+	}
+	query := `SELECT rowid, title, COALESCE(folder, ''), COALESCE(tags, ''),
+		COALESCE(frontmatter, '{}'), updated_at, created_at
+		FROM notes`
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY " + order + " LIMIT ?"
+	arguments = append(arguments, limit)
+	rows, err := a.readDB.Query(query, arguments...)
 	if err != nil {
 		return blockWarning("não foi possível montar a tabela")
 	}
 	defer rows.Close()
-	lines := make([]string, 0, limit+2)
 	headers := make([]string, len(columns))
 	for index, column := range columns {
-		headers[index] = tableColumnLabel(column)
+		headers[index] = tableColumnLabel(column.name)
 	}
+	lines := make([]string, 0, limit+2)
 	lines = append(lines, "| "+strings.Join(headers, " | ")+" |")
 	lines = append(lines, "|"+strings.Repeat(" --- |", len(columns)))
 	count := 0
-	for rows.Next() && count < limit {
+	for rows.Next() {
 		var id int64
-		var title, noteFolder, tags, updatedAt, createdAt string
-		if err := rows.Scan(&id, &title, &noteFolder, &tags, &updatedAt, &createdAt); err != nil {
+		var title, folder, tags, frontmatter, updatedAt, createdAt string
+		if err := rows.Scan(&id, &title, &folder, &tags, &frontmatter, &updatedAt, &createdAt); err != nil {
 			return blockWarning("não foi possível montar a tabela")
 		}
-		if tag != "" && !containsTag(splitTags(tags), tag) {
-			continue
+		properties := make(map[string]any)
+		if frontmatter != "" {
+			if err := json.Unmarshal([]byte(frontmatter), &properties); err != nil {
+				properties = make(map[string]any)
+			}
+		}
+		note := tableBlockRow{
+			id:         id,
+			title:      title,
+			folder:     folder,
+			tags:       tags,
+			updatedAt:  updatedAt,
+			createdAt:  createdAt,
+			properties: properties,
 		}
 		cells := make([]string, len(columns))
 		for index, column := range columns {
-			switch column {
-			case "titulo":
-				cells[index] = fmt.Sprintf("[%s](?note=%d)", escapeMarkdownLinkLabel(title), id)
-			case "pasta":
-				cells[index] = escapeTableCell(noteFolder)
-			case "tags":
-				cells[index] = escapeTableCell(strings.Join(splitTags(tags), ", "))
-			case "criado":
-				cells[index] = shortTimestamp(createdAt)
-			default:
-				cells[index] = shortTimestamp(updatedAt)
-			}
+			cells[index] = tableBlockCell(column, note)
 		}
 		lines = append(lines, "| "+strings.Join(cells, " | ")+" |")
 		count++
@@ -392,50 +520,160 @@ func (a *App) renderTableBlock(args map[string]string) string {
 	return strings.Join(lines, "\n")
 }
 
-func parseTableColumns(raw string) []string {
-	columns := make([]string, 0, 4)
-	seen := make(map[string]struct{})
-	for _, field := range strings.Split(raw, ",") {
-		column := strings.ToLower(strings.TrimSpace(field))
-		switch column {
-		case "titulo", "pasta", "tags", "atualizado", "criado":
+type tableBlockRow struct {
+	id         int64
+	title      string
+	folder     string
+	tags       string
+	updatedAt  string
+	createdAt  string
+	properties map[string]any
+}
+
+func tableBlockCell(column tableBlockColumn, note tableBlockRow) string {
+	switch strings.ToLower(column.name) {
+	case "titulo":
+		return fmt.Sprintf("[%s](?note=%d)", escapeMarkdownLinkLabel(note.title), note.id)
+	case "pasta":
+		return escapeTableCell(note.folder)
+	case "tags":
+		return escapeTableCell(strings.Join(splitTags(note.tags), ", "))
+	case "atualizado":
+		return shortTimestamp(note.updatedAt)
+	case "criado":
+		return shortTimestamp(note.createdAt)
+	default:
+		return escapeTableCell(propertyText(propertyValue(note.properties, column.name)))
+	}
+}
+
+func folderFilter() string {
+	return "LOWER(COALESCE(folder, '')) = LOWER(?)"
+}
+
+func tagFilter() string {
+	return "EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND LOWER(nt.tag) = LOWER(?))"
+}
+
+// columnFilter builds the row filter of one column. Values are ORed inside the
+// column and ANDed with the other columns by the caller.
+func columnFilter(column tableBlockColumn) (string, []any) {
+	if len(column.values) == 0 {
+		return "", nil
+	}
+	parts := make([]string, 0, len(column.values))
+	arguments := make([]any, 0, len(column.values)*2)
+	for _, value := range column.values {
+		switch strings.ToLower(column.name) {
+		case "titulo":
+			parts = append(parts, "LOWER(title) LIKE '%' || LOWER(?) || '%'")
+			arguments = append(arguments, value)
+		case "pasta":
+			parts = append(parts, folderFilter())
+			arguments = append(arguments, value)
+		case "tags":
+			parts = append(parts, tagFilter())
+			arguments = append(arguments, value)
+		case "atualizado":
+			parts = append(parts, "COALESCE(updated_at, '') LIKE ? || '%'")
+			arguments = append(arguments, value)
+		case "criado":
+			parts = append(parts, "COALESCE(created_at, '') LIKE ? || '%'")
+			arguments = append(arguments, value)
 		default:
-			continue
+			parts = append(parts,
+				"LOWER(CAST(json_extract(COALESCE(frontmatter, '{}'), ?) AS TEXT)) = LOWER(?)")
+			arguments = append(arguments, jsonPropertyPath(column.name), value)
 		}
-		if _, duplicate := seen[column]; duplicate {
-			continue
+	}
+	return "(" + strings.Join(parts, " OR ") + ")", arguments
+}
+
+func parseOrderArgument(raw string) (string, string) {
+	direction := "ASC"
+	fields := strings.Fields(raw)
+	if len(fields) > 1 && strings.EqualFold(fields[len(fields)-1], "desc") {
+		direction = "DESC"
+		fields = fields[:len(fields)-1]
+	}
+	return strings.Join(fields, " "), direction
+}
+
+func tableOrderClause(name, direction string, arguments []any) (string, []any) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "atualizado":
+		return "updated_at " + direction + ", rowid " + direction, arguments
+	case "criado":
+		return "created_at " + direction + ", rowid " + direction, arguments
+	case "titulo":
+		return "title COLLATE NOCASE " + direction, arguments
+	case "pasta":
+		return "folder COLLATE NOCASE " + direction + ", title COLLATE NOCASE", arguments
+	case "tags":
+		return "COALESCE(tags, '') COLLATE NOCASE " + direction, arguments
+	default:
+		return "json_extract(COALESCE(frontmatter, '{}'), ?) COLLATE NOCASE " + direction,
+			append(arguments, jsonPropertyPath(name))
+	}
+}
+
+func jsonPropertyPath(name string) string {
+	escaped := strings.ReplaceAll(name, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return `$."` + escaped + `"`
+}
+
+func propertyValue(properties map[string]any, name string) any {
+	if value, exists := properties[name]; exists {
+		return value
+	}
+	lowered := strings.ToLower(name)
+	for key, value := range properties {
+		if strings.ToLower(key) == lowered {
+			return value
 		}
-		seen[column] = struct{}{}
-		columns = append(columns, column)
 	}
-	if len(columns) == 0 {
-		return []string{"titulo", "atualizado"}
+	return nil
+}
+
+func propertyText(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(typed)
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text := propertyText(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, ", ")
+	default:
+		return fmt.Sprint(typed)
 	}
-	return columns
 }
 
 func tableColumnLabel(column string) string {
-	switch column {
+	switch strings.ToLower(column) {
 	case "titulo":
 		return "Título"
 	case "pasta":
 		return "Pasta"
 	case "tags":
 		return "Tags"
+	case "atualizado":
+		return "Atualizado"
 	case "criado":
 		return "Criado"
 	default:
-		return "Atualizado"
+		return column
 	}
-}
-
-func containsTag(tags []string, wanted string) bool {
-	for _, tag := range tags {
-		if strings.EqualFold(tag, wanted) {
-			return true
-		}
-	}
-	return false
 }
 
 func shortTimestamp(value string) string {

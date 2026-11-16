@@ -102,6 +102,110 @@ func TestTableBlockRendersColumnsAndFiltersByTag(t *testing.T) {
 	}
 }
 
+func TestParseBlockArgsAcceptsNestedQuotes(t *testing.T) {
+	args := parseBlockArgs(` colunas="tags="amigo",pasta="sei lá"" limite=5`)
+	if args["colunas"] != `tags="amigo",pasta="sei lá"` {
+		t.Fatalf("nested quotes were not preserved: %#v", args)
+	}
+	if args["limite"] != "5" {
+		t.Fatalf("argument after the nested value was lost: %#v", args)
+	}
+}
+
+func TestTableBlockFiltersByColumnValues(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.CreateNote(Note{Title: "Amigo na praia", Folder: "Projetos", Tags: []string{"amigo"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.CreateNote(Note{Title: "Projeto sem tag", Folder: "Projetos", Tags: []string{"outro"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.CreateNote(Note{Title: "Amigo em outra pasta", Folder: "Pessoal", Tags: []string{"amigo"}}); err != nil {
+		t.Fatal(err)
+	}
+	expanded := app.expandNoteBlocks(
+		`<!-- ton618:tabela colunas="titulo,pasta=Projetos,tags=amigo" -->`,
+		noteBlockContext{})
+	if !strings.Contains(expanded.markdown, "| Título | Pasta | Tags |") {
+		t.Fatalf("table header is wrong: %s", expanded.markdown)
+	}
+	if !strings.Contains(expanded.markdown, "Amigo na praia") {
+		t.Fatalf("matching row is missing: %s", expanded.markdown)
+	}
+	if strings.Contains(expanded.markdown, "Projeto sem tag") ||
+		strings.Contains(expanded.markdown, "Amigo em outra pasta") {
+		t.Fatalf("column filters did not restrict the rows: %s", expanded.markdown)
+	}
+}
+
+func TestTableBlockAcceptsNestedQuotesInColumns(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.CreateNote(Note{Title: "Nota do amigo", Folder: "sei lá", Tags: []string{"amigo"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.CreateNote(Note{Title: "Outra nota", Folder: "sei lá", Tags: []string{"outro"}}); err != nil {
+		t.Fatal(err)
+	}
+	expanded := app.expandNoteBlocks(
+		`<!-- ton618:tabela colunas="titulo,tags="amigo",pasta="sei lá"" -->`,
+		noteBlockContext{})
+	if !strings.Contains(expanded.markdown, "Nota do amigo") {
+		t.Fatalf("nested quoted filters did not match: %s", expanded.markdown)
+	}
+	if strings.Contains(expanded.markdown, "Outra nota") {
+		t.Fatalf("tag filter was ignored: %s", expanded.markdown)
+	}
+}
+
+func TestTableBlockShowsAndFiltersFrontmatterProperties(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.CreateNote(Note{
+		Title:   "Entrega aberta",
+		Content: "---\nstatus: aberto\nprioridade: 2\n---\n\nTexto",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.CreateNote(Note{
+		Title:   "Entrega fechada",
+		Content: "---\nstatus: fechado\nprioridade: 1\n---\n\nTexto",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	expanded := app.expandNoteBlocks(
+		`<!-- ton618:tabela colunas="titulo,status=aberto" -->`, noteBlockContext{})
+	if !strings.Contains(expanded.markdown, "| Título | status |") {
+		t.Fatalf("property column header is wrong: %s", expanded.markdown)
+	}
+	if !strings.Contains(expanded.markdown, "Entrega aberta") || !strings.Contains(expanded.markdown, "aberto") {
+		t.Fatalf("property cell is missing: %s", expanded.markdown)
+	}
+	if strings.Contains(expanded.markdown, "Entrega fechada") {
+		t.Fatalf("property filter did not apply: %s", expanded.markdown)
+	}
+}
+
+func TestTableBlockOrdersByProperty(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.CreateNote(Note{Title: "Depois", Content: "---\nprioridade: 2\n---"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.CreateNote(Note{Title: "Antes", Content: "---\nprioridade: 1\n---"}); err != nil {
+		t.Fatal(err)
+	}
+	expanded := app.expandNoteBlocks(
+		`<!-- ton618:tabela colunas="titulo,prioridade" ordenar="prioridade" -->`, noteBlockContext{})
+	if !strings.Contains(expanded.markdown, "| Título | prioridade |") {
+		t.Fatalf("unexpected header: %s", expanded.markdown)
+	}
+	rows := strings.Split(expanded.markdown, "\n")
+	if len(rows) != 4 {
+		t.Fatalf("unexpected table rows: %s", expanded.markdown)
+	}
+	if !strings.Contains(rows[2], "Antes") {
+		t.Fatalf("rows are not ordered by the property: %s", expanded.markdown)
+	}
+}
+
 func TestUnknownBlockAndInvalidContextBecomeWarnings(t *testing.T) {
 	app := newTestApp(t)
 	unknown := app.expandNoteBlocks("<!-- ton618:inexistente -->", noteBlockContext{})

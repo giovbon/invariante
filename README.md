@@ -156,9 +156,11 @@ O preview interpreta comentários `<!-- ton618:... -->` sozinhos na linha e os s
 | `<!-- ton618:recentes -->` | `pasta="X"`, `limite=N` | últimas notas alteradas |
 | `<!-- ton618:toc -->` | `nivel=3` | índice dos cabeçalhos da nota |
 | `<!-- ton618:links -->` | `limite=N` | links de saída da nota, com destinos ausentes sinalizados |
-| `<!-- ton618:tabela -->` | `pasta="X"`, `tag="x"`, `colunas="titulo,tags"`, `limite=N` | tabela de notas |
+| `<!-- ton618:tabela -->` | `colunas`, `pasta`, `tag`, `ordenar`, `limite` | tabela de notas, com filtros por coluna |
 
 Cada nota aceita até 20 blocos, com até 50 itens cada. Nomes ou argumentos inválidos aparecem como aviso no preview, e `backlinks` e `links` exigem uma nota já salva.
+
+No bloco `tabela`, cada item de `colunas` é uma coluna e pode carregar o valor que filtra as linhas: `colunas="titulo,pasta=Projetos,tags=amigo"` mostra **Título**, **Pasta** e **Tags**, mantendo apenas as notas da pasta `Projetos` com a tag `amigo`. As colunas aceitam `titulo`, `pasta`, `tags`, `atualizado`, `criado` e qualquer propriedade do frontmatter (`status`, `prioridade`…). Valores com espaço podem ser citados, inclusive com aspas aninhadas — `colunas="tags="amigo",pasta="sei lá""` —, e `|` separa alternativas (`tags=amigo|família`). Filtros de colunas diferentes se somam (E); na mesma coluna são alternativas (OU). Use `ordenar="prazo desc"` (ou `titulo`, `pasta`, `atualizado`, `criado`) para a ordem e `limite=N`, até 50, para o tamanho.
 
 ## Dados, anexos e backup
 
