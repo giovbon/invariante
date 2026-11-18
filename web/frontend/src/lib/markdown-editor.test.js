@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EDITOR_HIGHLIGHT_LIMITS, ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, indentSelection, isMarkmapNote, MarkdownEditor, noteType, parseFrontmatter, setFrontmatterProperty, shouldRenderEditorHighlight, stripFrontmatter } from './markdown-editor.js';
+import { EDITOR_HIGHLIGHT_MAX_LENGTH, diffLineRanges, ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, indentSelection, isMarkmapNote, MarkdownEditor, noteType, parseFrontmatter, planHighlightUpdate, renderMarkdownLines, setFrontmatterProperty, shouldRenderEditorHighlight, stripFrontmatter } from './markdown-editor.js';
 import { formatISODate } from './snippets.js';
 
 function createTextarea(value, start = 0, end = start) {
@@ -570,13 +570,72 @@ test('highlights Markdown structures and identifies fenced code languages', () =
     }
 });
 
-test('decide quando o overlay de sintaxe deve sair de cena em notas grandes', () => {
+test('decide quando o overlay de sintaxe deve sair de cena em notas enormes', () => {
     assert.equal(shouldRenderEditorHighlight(1_000), true);
-    assert.equal(shouldRenderEditorHighlight(EDITOR_HIGHLIGHT_LIMITS.plainWhileTyping + 1, { typing: true }), false);
-    // Fora da digitação a nota grande ainda recebe realce.
-    assert.equal(shouldRenderEditorHighlight(EDITOR_HIGHLIGHT_LIMITS.plainWhileTyping + 1), true);
-    assert.equal(shouldRenderEditorHighlight(EDITOR_HIGHLIGHT_LIMITS.maxLive + 1), false);
-    assert.equal(shouldRenderEditorHighlight(EDITOR_HIGHLIGHT_LIMITS.maxLive + 1, { typing: true }), false);
+    assert.equal(shouldRenderEditorHighlight(60_001), true);
+    assert.equal(shouldRenderEditorHighlight(EDITOR_HIGHLIGHT_MAX_LENGTH), true);
+    assert.equal(shouldRenderEditorHighlight(EDITOR_HIGHLIGHT_MAX_LENGTH + 1), false);
+    // O modo de edição mantém a cor enquanto digita em notas grandes.
+    assert.equal(shouldRenderEditorHighlight(200_000), true);
+});
+
+test('renderiza linhas isoladas com o mesmo HTML do documento inteiro', () => {
+    const lines = [
+        '# Título',
+        '',
+        '```js',
+        'const a = 1;',
+        '// comentário',
+        '```',
+        '',
+        '**forte** e TODO'
+    ];
+    const perLine = renderMarkdownLines(lines);
+    assert.equal(perLine.join('\n'), highlightMarkdown(lines.join('\n')));
+    // Um recorte no meio de um bloco cercado ainda usa o bloco inteiro.
+    const slice = renderMarkdownLines(lines, undefined, { start: 3, end: 4 });
+    assert.equal(slice[3], perLine[3]);
+    assert.equal(slice[0], undefined);
+});
+
+test('calcula o menor intervalo de linhas alterado', () => {
+    assert.deepEqual(diffLineRanges(['a', 'b', 'c'], ['a', 'b', 'c']), {
+        start: 3, oldEnd: 3, newEnd: 3, changed: false
+    });
+    assert.deepEqual(diffLineRanges(['a', 'b', 'c'], ['a', 'B', 'c']), {
+        start: 1, oldEnd: 2, newEnd: 2, changed: true
+    });
+    assert.deepEqual(diffLineRanges(['a', 'b'], ['a', 'x', 'b']), {
+        start: 1, oldEnd: 1, newEnd: 2, changed: true
+    });
+    assert.deepEqual(diffLineRanges(['a', 'x', 'b'], ['a', 'b']), {
+        start: 1, oldEnd: 2, newEnd: 1, changed: true
+    });
+});
+
+test('planeja atualização incremental respeitando blocos cercados', () => {
+    const base = ['texto', '```js', 'const a = 1;', 'const b = 2;', '```', 'fim'];
+    // Editar dentro do bloco reconstrói o bloco inteiro (Highlight.js).
+    assert.deepEqual(
+        planHighlightUpdate(base, ['texto', '```js', 'const a = 1;', 'const b = 3;', '```', 'fim']),
+        { start: 1, oldEnd: 5, newEnd: 5 }
+    );
+    // Inserir uma linha no bloco também cobre o bloco inteiro.
+    assert.deepEqual(
+        planHighlightUpdate(base, ['texto', '```js', 'const a = 1;', 'const c = 3;', 'const b = 2;', '```', 'fim']),
+        { start: 1, oldEnd: 5, newEnd: 6 }
+    );
+    // Mexer na cerca muda o bloco de todas as linhas seguintes.
+    assert.deepEqual(
+        planHighlightUpdate(base, ['texto', '````js', 'const a = 1;', 'const b = 2;', '```', 'fim']),
+        { start: 1, oldEnd: 6, newEnd: 6 }
+    );
+    // Linha de texto comum atualiza só ela mesma.
+    assert.deepEqual(
+        planHighlightUpdate(base, ['texto', '```js', 'const a = 1;', 'const b = 2;', '```', 'FIM']),
+        { start: 5, oldEnd: 6, newEnd: 6 }
+    );
+    assert.equal(planHighlightUpdate(base, base), null);
 });
 
 test('o realce preserva o texto exato para manter seleção e cursor alinhados', () => {

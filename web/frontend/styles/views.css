@@ -652,6 +652,23 @@
         pointer-events: none;
     }
 
+    /* Uma div por linha lógica permite atualizar apenas o trecho editado. */
+    .source-line {
+        display: block;
+        min-height: 1.65em;
+        min-height: 1lh;
+        margin: 0;
+        padding: 0;
+        white-space: pre-wrap;
+        overflow-wrap: break-word;
+    }
+
+    /* Se a barra de rolagem do textarea ocupar largura, o <pre> (overflow:
+       hidden) precisa reservar o mesmo espaço para as quebras coincidirem. */
+    .source-highlight {
+        padding-right: calc(12px + var(--editor-gutter, 0px));
+    }
+
     .source-editor textarea {
         z-index: 1;
         resize: none;
@@ -678,9 +695,7 @@
         -webkit-text-fill-color: var(--faint);
     }
 
-    /* Notas grandes: durante a digitação/cola o overlay é escondido e o texto
-       nativo do textarea aparece. Assim não existe camada visual atrasada em
-       relação à seleção e ao cursor. */
+    /* Notas acima do limite de realce: o textarea mostra o próprio texto. */
     .source-editor.is-plain-text .source-highlight {
         visibility: hidden;
     }
@@ -786,7 +801,14 @@
         padding: 12px max(12px, calc((100% - 42rem) / 2));
     }
 
+    .editor-workspace[data-editor-mode="edit"] .source-highlight {
+        padding-right: calc(max(12px, (100% - 42rem) / 2) + var(--editor-gutter, 0px));
+    }
+
     .editor-workspace[data-editor-mode="edit"] .source-editor textarea {
+        /* Barra sempre reservada: a largura disponível (e as quebras de
+           linha) não muda quando a rolagem aparece. */
+        overflow-y: scroll;
         scrollbar-width: thin;
         scrollbar-color: var(--scrollbar-thumb) transparent;
     }

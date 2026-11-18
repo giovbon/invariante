@@ -1,6 +1,6 @@
 import { requestJSON, requestJSONResponse } from './lib/api-client.js';
 import { CommandPalette } from './lib/command-palette.js';
-import { ensureFrontmatterTags, extractMarkdownOutline, highlightMarkdown, MarkdownEditor, setFrontmatterProperty, shouldRenderEditorHighlight, DEFAULT_TASK_MARKERS } from './lib/markdown-editor.js';
+import { ensureFrontmatterTags, extractMarkdownOutline, MarkdownEditor, planHighlightUpdate, renderMarkdownLines, setFrontmatterProperty, shouldRenderEditorHighlight, DEFAULT_TASK_MARKERS } from './lib/markdown-editor.js';
 import { GraphView } from './lib/graph-view.js';
 import { formatFileSize } from './lib/format.js';
 import { normalizeLinkPath } from './lib/note-links.js';
@@ -239,45 +239,121 @@ function setEditorPlainText(plain) {
     elements.sourceEditor.classList.toggle('is-plain-text', plain);
 }
 
-function syncMarkdownHighlight() {
-    const value = elements.noteContent.value;
-    if (!shouldRenderEditorHighlight(value.length)) {
-        // Sem overlay: o textarea mostra o próprio texto (CSS) e continua
-        // rápido mesmo em notas enormes.
-        setEditorPlainText(true);
-        return;
-    }
-    setEditorPlainText(false);
-    elements.noteContentHighlight.innerHTML = `${highlightMarkdown(value, state.taskMarkers)}\n`;
+// O overlay usa uma div por linha lógica. Assim é possível atualizar apenas as
+// linhas alteradas: dentro de um bloco inline único, qualquer mudança força o
+// Chromium a refazer o layout de toda a nota — com notas grandes, o texto
+// visível ficava para trás da seleção e do cursor.
+let renderedHighlight = null;
+
+function refreshEditorGutter() {
+    // Em navegadores com barra de rolagem clássica ela ocupa largura dentro do
+    // textarea, mas não dentro do <pre> (overflow: hidden). Compensar no
+    // padding mantém as quebras de linha idênticas.
+    const gutter = Math.max(0, elements.noteContent.offsetWidth - elements.noteContent.clientWidth);
+    elements.sourceEditor.style.setProperty('--editor-gutter', `${gutter}px`);
+}
+
+function syncHighlightScroll() {
     elements.noteContentHighlight.scrollTop = elements.noteContent.scrollTop;
     elements.noteContentHighlight.scrollLeft = elements.noteContent.scrollLeft;
 }
 
-let markdownHighlightTimer = null;
+function refreshEditorHighlightLayout() {
+    refreshEditorGutter();
+    syncHighlightScroll();
+}
+
+function createHighlightLine(html) {
+    const line = document.createElement('div');
+    line.className = 'source-line';
+    line.innerHTML = html ?? '';
+    return line;
+}
+
+function renderHighlightFull(value) {
+    const lines = value.split('\n');
+    const html = renderMarkdownLines(lines, state.taskMarkers);
+    const fragment = document.createDocumentFragment();
+    const lineElements = new Array(lines.length);
+    for (let index = 0; index < lines.length; index++) {
+        const line = createHighlightLine(html[index]);
+        lineElements[index] = line;
+        fragment.append(line);
+    }
+    elements.noteContentHighlight.replaceChildren(fragment);
+    renderedHighlight = { value, lines, elements: lineElements };
+    syncHighlightScroll();
+}
+
+function syncMarkdownHighlight() {
+    const value = elements.noteContent.value;
+    refreshEditorGutter();
+    if (!shouldRenderEditorHighlight(value.length)) {
+        // Sem overlay: o textarea mostra o próprio texto (CSS) e continua
+        // rápido mesmo em notas enormes.
+        setEditorPlainText(true);
+        renderedHighlight = null;
+        return;
+    }
+    setEditorPlainText(false);
+    renderHighlightFull(value);
+}
+
+function updateMarkdownHighlight() {
+    const value = elements.noteContent.value;
+    if (!shouldRenderEditorHighlight(value.length)) {
+        setEditorPlainText(true);
+        renderedHighlight = null;
+        return;
+    }
+    if (!renderedHighlight || elements.sourceEditor.classList.contains('is-plain-text')) {
+        setEditorPlainText(false);
+        renderHighlightFull(value);
+        return;
+    }
+    if (value === renderedHighlight.value) {
+        syncHighlightScroll();
+        return;
+    }
+    const nextLines = value.split('\n');
+    const plan = planHighlightUpdate(renderedHighlight.lines, nextLines);
+    if (!plan) {
+        renderedHighlight.value = value;
+        syncHighlightScroll();
+        return;
+    }
+    const html = renderMarkdownLines(nextLines, state.taskMarkers, { start: plan.start, end: plan.newEnd });
+    const anchor = renderedHighlight.elements[plan.oldEnd] || null;
+    const fragment = document.createDocumentFragment();
+    const newElements = [];
+    for (let index = plan.start; index < plan.newEnd; index++) {
+        const line = createHighlightLine(html[index]);
+        newElements.push(line);
+        fragment.append(line);
+    }
+    for (let index = plan.start; index < plan.oldEnd; index++) {
+        renderedHighlight.elements[index]?.remove();
+    }
+    if (anchor) elements.noteContentHighlight.insertBefore(fragment, anchor);
+    else elements.noteContentHighlight.append(fragment);
+    renderedHighlight.elements.splice(plan.start, plan.oldEnd - plan.start, ...newElements);
+    renderedHighlight.lines = nextLines;
+    renderedHighlight.value = value;
+    syncHighlightScroll();
+}
+
+let markdownHighlightFrame = 0;
 let outlineRefreshTimer = null;
 let previewHeightFrame = 0;
 
 function scheduleMarkdownHighlight() {
-    window.clearTimeout(markdownHighlightTimer);
-    const length = elements.noteContent.value.length;
-    if (!shouldRenderEditorHighlight(length)) {
-        setEditorPlainText(true);
-        return;
-    }
-    if (!shouldRenderEditorHighlight(length, { typing: true })) {
-        // Enquanto digita, o overlay sai de cena: o texto do textarea fica
-        // visível, então seleção e cursor nunca ficam atrás do realce antigo.
-        setEditorPlainText(true);
-        markdownHighlightTimer = window.setTimeout(() => {
-            markdownHighlightTimer = null;
-            syncMarkdownHighlight();
-        }, 450);
-        return;
-    }
-    markdownHighlightTimer = window.setTimeout(() => {
-        markdownHighlightTimer = null;
-        syncMarkdownHighlight();
-    }, 120);
+    // Uma atualização por frame, sempre com o valor mais recente. Ela mexe
+    // apenas nas linhas que mudaram, então o realce acompanha a digitação.
+    if (markdownHighlightFrame) return;
+    markdownHighlightFrame = requestAnimationFrame(() => {
+        markdownHighlightFrame = 0;
+        updateMarkdownHighlight();
+    });
 }
 
 function scheduleOutlineRefresh() {
@@ -648,6 +724,7 @@ function setupEventListeners() {
         }
         editorPreview.syncMinimumHeight();
         editorPreview.syncScroll();
+        requestAnimationFrame(refreshEditorHighlightLayout);
         if (state.wikilinkAutocomplete.open) renderWikilinkAutocomplete();
     });
     elements.noteTitle.addEventListener('input', () => {
@@ -668,7 +745,10 @@ function setupEventListeners() {
         if (button) markdownEditor.format(button.dataset.format);
     });
     document.querySelectorAll('.editor-mode[data-editor-mode]').forEach(button => {
-        button.addEventListener('click', () => editorPreview.setMode(button.dataset.editorMode));
+        button.addEventListener('click', () => {
+            editorPreview.setMode(button.dataset.editorMode);
+            requestAnimationFrame(refreshEditorHighlightLayout);
+        });
     });
     window.addEventListener('popstate', event => void handlePopState(event));
     window.addEventListener('beforeunload', event => {
@@ -706,6 +786,7 @@ function setupEventListeners() {
             if (mode) {
                 event.preventDefault();
                 editorPreview.setMode(mode);
+                requestAnimationFrame(refreshEditorHighlightLayout);
             }
         }
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'n') {
@@ -1578,6 +1659,7 @@ function showEditor(note) {
     elements.noteContentHighlight.scrollTop = 0;
     elements.markdownPreview.scrollTop = 0;
     elements.noteContent.focus();
+    requestAnimationFrame(refreshEditorHighlightLayout);
     updateEditorBreadcrumb();
     if (note) {
         void loadAttachments(note.id);

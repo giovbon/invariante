@@ -30,6 +30,11 @@ test('o realce mantém a geometria do textarea com marcadores e blocos de códig
         'const answer = 42;',
         '```',
         '',
+        '   espaços à esquerda e no fim da linha   ',
+        'coluna um\tcoluna dois\tcoluna três\tcoluna quatro\tcoluna cinco\tcoluna seis',
+        'x'.repeat(300),
+        '',
+        '',
         'Texto normal no final.'
     ].join('\n');
     await openInEditMode(page, request, content);
@@ -50,7 +55,11 @@ test('o realce mantém a geometria do textarea com marcadores e blocos de códig
         const paddingRight = parseFloat(computed.paddingRight) || 0;
         style.boxSizing = 'content-box';
         style.width = `${ta.clientWidth - paddingLeft - paddingRight}px`;
-        style.padding = computed.padding;
+        // Firefox devolve o shorthand com porcentagens; copie os lados resolvidos.
+        style.paddingTop = computed.paddingTop;
+        style.paddingRight = computed.paddingRight;
+        style.paddingBottom = computed.paddingBottom;
+        style.paddingLeft = computed.paddingLeft;
         style.border = '0';
         style.height = 'auto';
         style.overflow = 'hidden';
@@ -75,6 +84,18 @@ test('o realce mantém a geometria do textarea com marcadores e blocos de códig
             }
             return nodes;
         };
+        // O overlay tem uma div por linha; o textarea conta o "\n" entre elas.
+        const highlightNodes = [];
+        let highlightOffset = 0;
+        for (const line of hl.children) {
+            const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+            let node;
+            while ((node = walker.nextNode())) {
+                highlightNodes.push({ node, start: highlightOffset });
+                highlightOffset += node.data.length;
+            }
+            highlightOffset += 1;
+        }
         const rectAt = (nodes, offset, hostRect) => {
             for (const entry of nodes) {
                 if (offset < entry.start || offset >= entry.start + entry.node.data.length) continue;
@@ -89,7 +110,6 @@ test('o realce mantém a geometria do textarea com marcadores e blocos de códig
         };
 
         const mirrorNodes = textNodes(mirror);
-        const highlightNodes = textNodes(hl);
         const mirrorRect = mirror.getBoundingClientRect();
         const highlightRect = hl.getBoundingClientRect();
         const differences = [];
@@ -111,6 +131,11 @@ test('o realce mantém a geometria do textarea com marcadores e blocos de códig
     });
 
     expect(mismatches).toEqual([]);
+    expect(await page.evaluate(() => {
+        const ta = document.querySelector('#noteContent');
+        const hl = document.querySelector('#noteContentHighlight');
+        return hl.scrollHeight === ta.scrollHeight;
+    })).toBe(true);
 });
 
 test('digitando aspas, apóstrofos e parênteses o cursor não duplica fechamentos', async ({ page, request }) => {
@@ -180,22 +205,59 @@ test('colar um atalho não expande o snippet', async ({ page, request }) => {
     await expect(textarea).toHaveValue('antes ;hoje');
 });
 
-test('nota grande usa o texto nativo durante a digitação e recupera o realce depois', async ({ page, request }) => {
+test('nota grande mantém o realce e o texto sincronizados enquanto digita', async ({ page, request }) => {
     const line = 'Linha com **negrito**, TODO: marcador e `código` para a nota ficar grande.';
-    const content = Array.from({ length: 900 }, () => line).join('\n');
+    const content = Array.from({ length: 1500 }, () => line).join('\n');
     expect(content.length).toBeGreaterThan(60_000);
     await openInEditMode(page, request, content);
 
     const textarea = page.locator('#noteContent');
     const sourceEditor = page.locator('.source-editor');
+    const overlay = page.locator('#noteContentHighlight');
     await textarea.click();
-    await page.keyboard.press('Control+End');
+    await page.keyboard.press('Control+Home');
     await page.keyboard.type('X');
 
-    await expect(sourceEditor).toHaveClass(/is-plain-text/);
-    await expect(textarea).toHaveValue(`${content}X`);
-    expect(await textarea.evaluate(el => el.selectionStart)).toBe(content.length + 1);
-
+    // Continua no modo com realce colorido (nada de perder a cor ao digitar).
     await expect(sourceEditor).not.toHaveClass(/is-plain-text/);
-    await expect(page.locator('#noteContentHighlight')).not.toBeEmpty();
+    await expect(textarea).toHaveValue(`X${content}`);
+    expect(await textarea.evaluate(el => el.selectionStart)).toBe(1);
+    // A linha editada é atualizada no mesmo frame e mantém o negrito.
+    await expect(overlay.locator('.source-line').first()).toContainText('XLinha com');
+    await expect(overlay.locator('.source-line').first().locator('.md-strong')).toHaveCount(1);
+    await expect(overlay.locator('.source-line')).toHaveCount(1500);
+});
+
+test('nota grande mantém texto, seleção e digitação em sincronia depois de editar', async ({ page, request }) => {
+    const lines = Array.from({ length: 1500 }, (_, index) =>
+        `Linha ${index} com **negrito**, TODO: marcador e \`código\`.`);
+    lines[700] = 'Linha ALVO para editar no meio da nota grande.';
+    const content = lines.join('\n');
+    expect(content.length).toBeGreaterThan(60_000);
+    await openInEditMode(page, request, content);
+
+    const textarea = page.locator('#noteContent');
+    const overlayLines = () => page.evaluate(() =>
+        [...document.querySelectorAll('#noteContentHighlight .source-line')]
+            .map(line => line.textContent).join('\n'));
+    await textarea.evaluate(el => {
+        el.focus();
+        const position = el.value.indexOf('ALVO');
+        el.setSelectionRange(position, position);
+    });
+    const position = content.indexOf('ALVO');
+    await page.keyboard.type('INSERIDO');
+    const typed = content.replace('ALVO', 'INSERIDOALVO');
+    await expect(textarea).toHaveValue(typed);
+    expect(await textarea.evaluate(el => el.selectionStart)).toBe(position + 8);
+    await expect.poll(overlayLines).toBe(typed);
+
+    // Seleciona o que foi digitado com Shift e substitui.
+    for (let index = 0; index < 8; index++) await page.keyboard.press('Shift+ArrowLeft');
+    expect(await textarea.evaluate(el => el.selectionStart)).toBe(position);
+    await page.keyboard.type('Y');
+    const replaced = content.replace('ALVO', 'YALVO');
+    await expect(textarea).toHaveValue(replaced);
+    expect(await textarea.evaluate(el => el.selectionStart)).toBe(position + 1);
+    await expect.poll(overlayLines).toBe(replaced);
 });

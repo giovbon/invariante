@@ -470,7 +470,13 @@ function measureEditorLines(markdown, lines) {
     const paddingRight = parseFloat(computed.paddingRight) || 0;
     mirror.style.boxSizing = 'content-box';
     mirror.style.width = `${Math.max(0, editor.clientWidth - paddingLeft - paddingRight)}px`;
-    mirror.style.padding = computed.padding;
+    // Firefox serializa o shorthand com porcentagens (ex.: `max(12px, 50% -
+    // 336px)`), que seriam recalculadas contra a largura do espelho. Copiar os
+    // lados já resolvidos mantém as medidas iguais às do textarea.
+    mirror.style.paddingTop = computed.paddingTop;
+    mirror.style.paddingRight = computed.paddingRight;
+    mirror.style.paddingBottom = computed.paddingBottom;
+    mirror.style.paddingLeft = computed.paddingLeft;
     mirror.style.border = '0';
     mirror.style.height = 'auto';
     mirror.style.overflow = 'hidden';

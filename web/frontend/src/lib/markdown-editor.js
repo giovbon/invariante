@@ -512,19 +512,12 @@ function escapeHTML(source) {
     return source.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
-// Limites do realce ao vivo do modo de edição. Montar o overlay é caro em
-// notas grandes; acima de `plainWhileTyping` ele é escondido enquanto o texto
-// está sendo alterado (o textarea nativo aparece, sem atraso de cursor) e volta
-// depois de uma pausa. Acima de `maxLive` ele não é gerado.
-export const EDITOR_HIGHLIGHT_LIMITS = Object.freeze({
-    plainWhileTyping: 60_000,
-    maxLive: 300_000
-});
+// Acima deste tamanho o realce colorido é desligado: montar milhares de linhas
+// com spans custa caro demais. O textarea passa a mostrar o próprio texto.
+export const EDITOR_HIGHLIGHT_MAX_LENGTH = 300_000;
 
-export function shouldRenderEditorHighlight(length, { typing = false } = {}) {
-    if (length > EDITOR_HIGHLIGHT_LIMITS.maxLive) return false;
-    if (typing && length > EDITOR_HIGHLIGHT_LIMITS.plainWhileTyping) return false;
-    return true;
+export function shouldRenderEditorHighlight(length) {
+    return length <= EDITOR_HIGHLIGHT_MAX_LENGTH;
 }
 
 export const DEFAULT_TASK_MARKERS = ['TODO', 'FIXME', 'HACK', 'XXX', 'BUG', 'NOTE'];
@@ -575,39 +568,146 @@ function highlightMarkdownLine(source, markers) {
     return highlightTaskMarkers(result, markers);
 }
 
-export function highlightMarkdown(source, markers = DEFAULT_TASK_MARKERS) {
-    const lines = source.split('\n');
-    const highlighted = [];
-    for (let index = 0; index < lines.length; index++) {
-        const line = lines[index];
-        const opening = line.match(/^(\s*)(`{3,}|~{3,})([^\s`]*)?(.*)$/);
-        if (!opening) {
-            highlighted.push(highlightMarkdownLine(line, markers));
-            continue;
-        }
+function isFenceOpening(line) {
+    return /^(\s*)(`{3,}|~{3,})([^\s`]*)?(.*)$/.test(line);
+}
 
-        const [, indent, delimiter, language = '', rest] = opening;
-        const languageLabel = language
-            ? `<span class="md-code-language">${escapeHTML(language)}</span>`
-            : '';
-        highlighted.push(`${escapeHTML(indent)}<span class="md-code-fence">${escapeHTML(delimiter)}</span>${languageLabel}${escapeHTML(rest)}`);
-        const code = [];
-        let closed = false;
-        while (++index < lines.length) {
-            const closing = lines[index].match(/^\s*(`{3,}|~{3,})\s*$/);
+function isFenceDelimiter(line) {
+    return /^\s*(`{3,}|~{3,})/.test(line);
+}
+
+// Descreve, linha a linha, quais pertencem a blocos cercados. Serve para
+// atualizar apenas o trecho alterado do overlay sem perder o contexto do
+// Highlight.js (que realça o bloco inteiro de uma vez).
+export function scanMarkdownFenceBlocks(lines) {
+    const states = new Array(lines.length).fill(null);
+    const blocks = [];
+    for (let index = 0; index < lines.length; index++) {
+        if (!isFenceOpening(lines[index])) continue;
+        const [, indent, delimiter, language = '', rest] = lines[index].match(/^(\s*)(`{3,}|~{3,})([^\s`]*)?(.*)$/);
+        const block = {
+            index: blocks.length,
+            openLine: index,
+            closeLine: -1,
+            bodyStart: index + 1,
+            bodyEnd: index + 1,
+            language,
+            opening: { indent, delimiter, language, rest }
+        };
+        let cursor = index + 1;
+        for (; cursor < lines.length; cursor++) {
+            const closing = lines[cursor].match(/^\s*(`{3,}|~{3,})\s*$/);
             if (closing && closing[1][0] === delimiter[0] && closing[1].length >= delimiter.length) {
-                highlighted.push(`<span class="md-code-fence">${escapeHTML(lines[index])}</span>`);
-                closed = true;
+                block.closeLine = cursor;
+                block.bodyEnd = cursor;
                 break;
             }
-            code.push(lines[index]);
         }
-        if (code.length) {
-            const body = highlightCode(code.join('\n'), language);
-            highlighted.splice(highlighted.length - (closed ? 1 : 0), 0, ...body.split('\n'));
-        }
+        if (block.closeLine < 0) block.bodyEnd = lines.length;
+        for (let line = block.openLine; line < block.bodyEnd; line++) states[line] = block;
+        if (block.closeLine >= 0) states[block.closeLine] = block;
+        blocks.push(block);
+        index = block.closeLine >= 0 ? block.closeLine : lines.length;
     }
-    return highlighted.join('\n');
+    return { states, blocks };
+}
+
+function renderCodeBlock(block, lines) {
+    const { indent, delimiter, language, rest } = block.opening;
+    const languageLabel = language
+        ? `<span class="md-code-language">${escapeHTML(language)}</span>`
+        : '';
+    const rendered = [
+        `${escapeHTML(indent)}<span class="md-code-fence">${escapeHTML(delimiter)}</span>${languageLabel}${escapeHTML(rest)}`
+    ];
+    const code = lines.slice(block.bodyStart, block.bodyEnd);
+    if (code.length) {
+        const body = highlightCode(code.join('\n'), language);
+        rendered.push(...body.split('\n'));
+    }
+    if (block.closeLine >= 0) {
+        rendered.push(`<span class="md-code-fence">${escapeHTML(lines[block.closeLine])}</span>`);
+    }
+    return rendered;
+}
+
+// HTML de cada linha lógica. Um bloco de código é realçado por inteiro mesmo
+// quando só algumas linhas dele estão no intervalo pedido, para que o
+// Highlight.js continue coerente.
+export function renderMarkdownLines(lines, markers = DEFAULT_TASK_MARKERS, { start = 0, end = lines.length } = {}) {
+    const { states } = scanMarkdownFenceBlocks(lines);
+    const rendered = new Array(lines.length);
+    const blockCache = new Map();
+    const from = Math.max(0, Math.min(start, lines.length));
+    const to = Math.max(from, Math.min(end, lines.length));
+    for (let index = from; index < to; index++) {
+        const block = states[index];
+        if (!block) {
+            rendered[index] = highlightMarkdownLine(lines[index], markers);
+            continue;
+        }
+        let blockLines = blockCache.get(block.index);
+        if (!blockLines) {
+            blockLines = renderCodeBlock(block, lines);
+            blockCache.set(block.index, blockLines);
+        }
+        rendered[index] = blockLines[index - block.openLine] ?? '';
+    }
+    return rendered;
+}
+
+export function highlightMarkdown(source, markers = DEFAULT_TASK_MARKERS) {
+    const lines = source.split('\n');
+    return renderMarkdownLines(lines, markers).join('\n');
+}
+
+// Menor intervalo de linhas que mudou entre duas versões do texto.
+export function diffLineRanges(previousLines, nextLines) {
+    const maxPrefix = Math.min(previousLines.length, nextLines.length);
+    let start = 0;
+    while (start < maxPrefix && previousLines[start] === nextLines[start]) start++;
+    const maxSuffix = Math.min(previousLines.length, nextLines.length) - start;
+    let suffix = 0;
+    while (suffix < maxSuffix &&
+        previousLines[previousLines.length - 1 - suffix] === nextLines[nextLines.length - 1 - suffix]) {
+        suffix++;
+    }
+    const oldEnd = previousLines.length - suffix;
+    const newEnd = nextLines.length - suffix;
+    return { start, oldEnd, newEnd, changed: start < oldEnd || start < newEnd };
+}
+
+// Intervalo a reconstruir no overlay. Alterações dentro de um bloco cercado
+// incluem o bloco inteiro; mexer numa cerca reconstrói o restante da nota,
+// porque todas as linhas seguintes mudam de bloco.
+export function planHighlightUpdate(previousLines, nextLines) {
+    const diff = diffLineRanges(previousLines, nextLines);
+    if (!diff.changed) return null;
+
+    const oldScan = scanMarkdownFenceBlocks(previousLines);
+    const newScan = scanMarkdownFenceBlocks(nextLines);
+    let start = diff.start;
+    let oldEnd = diff.oldEnd;
+    let newEnd = diff.newEnd;
+
+    const startBlock = oldScan.states[diff.start] || newScan.states[diff.start];
+    if (startBlock) start = Math.min(start, startBlock.openLine);
+
+    const oldLastBlock = oldEnd > 0 ? oldScan.states[oldEnd - 1] : null;
+    if (oldLastBlock) {
+        oldEnd = oldLastBlock.closeLine < 0 ? previousLines.length : Math.max(oldEnd, oldLastBlock.closeLine + 1);
+    }
+    const newLastBlock = newEnd > 0 ? newScan.states[newEnd - 1] : null;
+    if (newLastBlock) {
+        newEnd = newLastBlock.closeLine < 0 ? nextLines.length : Math.max(newEnd, newLastBlock.closeLine + 1);
+    }
+
+    const touched = previousLines.slice(diff.start, diff.oldEnd)
+        .concat(nextLines.slice(diff.start, diff.newEnd));
+    if (touched.some(isFenceDelimiter)) {
+        return { start, oldEnd: previousLines.length, newEnd: nextLines.length };
+    }
+    return { start, oldEnd, newEnd };
 }
 
 export function ensureFrontmatterTags(content, tags) {
