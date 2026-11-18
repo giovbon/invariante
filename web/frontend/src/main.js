@@ -1,6 +1,6 @@
 import { requestJSON, requestJSONResponse } from './lib/api-client.js';
 import { CommandPalette } from './lib/command-palette.js';
-import { ensureFrontmatterTags, extractMarkdownOutline, highlightMarkdown, MarkdownEditor, setFrontmatterProperty, DEFAULT_TASK_MARKERS } from './lib/markdown-editor.js';
+import { ensureFrontmatterTags, extractMarkdownOutline, highlightMarkdown, MarkdownEditor, setFrontmatterProperty, shouldRenderEditorHighlight, DEFAULT_TASK_MARKERS } from './lib/markdown-editor.js';
 import { GraphView } from './lib/graph-view.js';
 import { formatFileSize } from './lib/format.js';
 import { normalizeLinkPath } from './lib/note-links.js';
@@ -121,6 +121,7 @@ const elements = {
     noteTitle: document.querySelector('#noteTitle'),
     noteContent: document.querySelector('#noteContent'),
     noteContentHighlight: document.querySelector('#noteContentHighlight'),
+    sourceEditor: document.querySelector('.source-editor'),
     markdownPreview: document.querySelector('#markdownPreview'),
     wikilinkAutocomplete: document.querySelector('#wikilinkAutocomplete'),
     helpDialog: document.querySelector('#helpDialog'),
@@ -234,17 +235,20 @@ const folderTree = createFolderTree({
     sidePanels
 });
 
-const maxLiveHighlightLength = 300_000;
+function setEditorPlainText(plain) {
+    elements.sourceEditor.classList.toggle('is-plain-text', plain);
+}
 
 function syncMarkdownHighlight() {
     const value = elements.noteContent.value;
-    if (value.length > maxLiveHighlightLength) {
-        // A full syntax pass on a multi-megabyte note would block typing.
-        // textContent keeps the overlay aligned without tokenizing it.
-        elements.noteContentHighlight.textContent = `${value}\n`;
-    } else {
-        elements.noteContentHighlight.innerHTML = `${highlightMarkdown(value, state.taskMarkers)}\n`;
+    if (!shouldRenderEditorHighlight(value.length)) {
+        // Sem overlay: o textarea mostra o próprio texto (CSS) e continua
+        // rápido mesmo em notas enormes.
+        setEditorPlainText(true);
+        return;
     }
+    setEditorPlainText(false);
+    elements.noteContentHighlight.innerHTML = `${highlightMarkdown(value, state.taskMarkers)}\n`;
     elements.noteContentHighlight.scrollTop = elements.noteContent.scrollTop;
     elements.noteContentHighlight.scrollLeft = elements.noteContent.scrollLeft;
 }
@@ -255,6 +259,21 @@ let previewHeightFrame = 0;
 
 function scheduleMarkdownHighlight() {
     window.clearTimeout(markdownHighlightTimer);
+    const length = elements.noteContent.value.length;
+    if (!shouldRenderEditorHighlight(length)) {
+        setEditorPlainText(true);
+        return;
+    }
+    if (!shouldRenderEditorHighlight(length, { typing: true })) {
+        // Enquanto digita, o overlay sai de cena: o texto do textarea fica
+        // visível, então seleção e cursor nunca ficam atrás do realce antigo.
+        setEditorPlainText(true);
+        markdownHighlightTimer = window.setTimeout(() => {
+            markdownHighlightTimer = null;
+            syncMarkdownHighlight();
+        }, 450);
+        return;
+    }
     markdownHighlightTimer = window.setTimeout(() => {
         markdownHighlightTimer = null;
         syncMarkdownHighlight();
@@ -553,11 +572,13 @@ function setupEventListeners() {
     elements.panelContent.addEventListener('dragleave', folderTree.handleDragLeave);
     elements.panelContent.addEventListener('drop', folderTree.handleDrop);
     elements.notesList.addEventListener('click', handleNoteListClick);
-    elements.noteContent.addEventListener('input', () => {
-        markdownEditor.handleInput();
+    elements.noteContent.addEventListener('input', event => {
+        markdownEditor.handleInput(event);
         editorPreview.syncMinimumHeight();
         scheduleWikilinkSuggestions();
     });
+    elements.noteContent.addEventListener('compositionstart', () => markdownEditor.handleCompositionStart());
+    elements.noteContent.addEventListener('compositionend', () => markdownEditor.handleCompositionEnd());
     elements.noteContent.addEventListener('keydown', event => {
         if (!handleWikilinkKeydown(event)) markdownEditor.handleKeydown(event);
     });
@@ -1716,7 +1737,7 @@ function insertAttachmentMarkdown(attachment) {
     textarea.value = next;
     textarea.focus();
     textarea.setSelectionRange(cursor, cursor);
-    markdownEditor.handleInput();
+    markdownEditor.handleInput({ inputType: 'insertFromPaste' });
 }
 
 async function deleteAttachment(attachmentID) {

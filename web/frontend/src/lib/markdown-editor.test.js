@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, indentSelection, isMarkmapNote, MarkdownEditor, noteType, parseFrontmatter, setFrontmatterProperty, stripFrontmatter } from './markdown-editor.js';
+import { EDITOR_HIGHLIGHT_LIMITS, ensureFrontmatterTags, extractMarkdownOutline, frontmatterLineOffset, highlightMarkdown, indentSelection, isMarkmapNote, MarkdownEditor, noteType, parseFrontmatter, setFrontmatterProperty, shouldRenderEditorHighlight, stripFrontmatter } from './markdown-editor.js';
 import { formatISODate } from './snippets.js';
 
 function createTextarea(value, start = 0, end = start) {
@@ -124,6 +124,165 @@ test('formats a selection and supports undo/redo', () => {
     assert.deepEqual(changes, ['**hello**', 'hello', '**hello**']);
 });
 
+function keyEvent(key, overrides = {}) {
+    return {
+        key,
+        ctrlKey: false,
+        metaKey: false,
+        altKey: false,
+        shiftKey: false,
+        preventDefault() {},
+        ...overrides
+    };
+}
+
+test('não indenta a linha seguinte quando a seleção termina no início dela', () => {
+    // "one\ntwo\n" selecionado: o \n final pertence à seleção, "three" não.
+    const result = indentSelection('one\ntwo\nthree', 0, 8);
+    assert.equal(result.value, '    one\n    two\nthree');
+    assert.equal(result.start, 4);
+    assert.equal(result.end, 16);
+});
+
+test('mantém a linha seguinte intacta ao formatar seleção que termina em quebra de linha', () => {
+    const textarea = createTextarea('one\ntwo\nthree', 0, 8);
+    const editor = new MarkdownEditor(textarea, () => {});
+    editor.format('unordered');
+    assert.equal(textarea.value, '- one\n- two\nthree');
+});
+
+test('undo devolve a seleção e a rolagem do passo desfeito', () => {
+    const textarea = createTextarea('hello', 0, 3);
+    textarea.scrollTop = 40;
+    textarea.scrollLeft = 2;
+    const editor = new MarkdownEditor(textarea, () => {});
+    textarea.value = 'hello world';
+    textarea.setSelectionRange(8, 11);
+    textarea.scrollTop = 120;
+    editor.handleInput({ inputType: 'insertText' });
+
+    editor.undo();
+    assert.equal(textarea.value, 'hello');
+    assert.equal(textarea.selectionStart, 0);
+    assert.equal(textarea.selectionEnd, 3);
+    assert.equal(textarea.scrollTop, 40);
+
+    editor.redo();
+    assert.equal(textarea.value, 'hello world');
+    assert.equal(textarea.selectionStart, 8);
+    assert.equal(textarea.selectionEnd, 11);
+    assert.equal(textarea.scrollTop, 120);
+});
+
+test('colar cria um passo próprio de undo e não é engolido pela digitação seguinte', () => {
+    const textarea = createTextarea('original', 0);
+    const editor = new MarkdownEditor(textarea, () => {});
+    textarea.value = 'original colado';
+    textarea.setSelectionRange(15, 15);
+    // Mesmo com um input recente, colar não pode se fundir com a digitação.
+    editor.lastInputAt = Date.now();
+    editor.lastInputKind = 'type';
+    editor.handleInput({ inputType: 'insertFromPaste' });
+
+    textarea.value = 'original colado!';
+    textarea.setSelectionRange(17, 17);
+    editor.handleInput({ inputType: 'insertText' });
+
+    editor.undo();
+    assert.equal(textarea.value, 'original colado');
+    assert.equal(textarea.selectionStart, 15);
+    editor.undo();
+    assert.equal(textarea.value, 'original');
+});
+
+test('digitação rápida continua agrupada em um único passo de undo', () => {
+    const textarea = createTextarea('', 0);
+    const editor = new MarkdownEditor(textarea, () => {});
+    for (const value of ['a', 'ab', 'abc']) {
+        textarea.value = value;
+        textarea.setSelectionRange(value.length, value.length);
+        editor.handleInput({ inputType: 'insertText' });
+    }
+    assert.equal(editor.history.length, 2);
+    editor.undo();
+    assert.equal(textarea.value, '');
+});
+
+test('colar um atalho de snippet não o expande', () => {
+    const textarea = createTextarea('', 0);
+    const editor = new MarkdownEditor(textarea, () => {});
+    textarea.value = ';hoje';
+    textarea.setSelectionRange(5, 5);
+    editor.handleInput({ inputType: 'insertFromPaste' });
+    assert.equal(textarea.value, ';hoje');
+});
+
+test('composição de acentos registra um único passo e não expande snippets', () => {
+    const textarea = createTextarea('', 0);
+    const editor = new MarkdownEditor(textarea, () => {});
+    editor.handleCompositionStart();
+    textarea.value = 'a';
+    textarea.setSelectionRange(1, 1);
+    editor.handleInput({ inputType: 'insertCompositionText' });
+    textarea.value = 'á';
+    textarea.setSelectionRange(1, 1);
+    editor.handleInput({ inputType: 'insertCompositionText' });
+    assert.equal(editor.history.length, 1);
+
+    editor.handleCompositionEnd();
+    assert.equal(editor.history.length, 2);
+    editor.undo();
+    assert.equal(textarea.value, '');
+});
+
+test('fechar aspas já inseridas apenas atravessa o cursor', () => {
+    const textarea = createTextarea('"abc"', 4);
+    const editor = new MarkdownEditor(textarea, () => {});
+    let prevented = false;
+    editor.handleKeydown(keyEvent('"', { preventDefault() { prevented = true; } }));
+    assert.equal(prevented, true);
+    assert.equal(textarea.value, '"abc"');
+    assert.equal(textarea.selectionStart, 5);
+    assert.equal(textarea.selectionEnd, 5);
+});
+
+test('não insere par de aspas no meio de uma palavra', () => {
+    const textarea = createTextarea('don', 3);
+    const editor = new MarkdownEditor(textarea, () => {});
+    let prevented = false;
+    editor.handleKeydown(keyEvent("'", { preventDefault() { prevented = true; } }));
+    assert.equal(prevented, false);
+    assert.equal(textarea.value, 'don');
+});
+
+test('Backspace dentro de um par vazio remove os dois lados', () => {
+    const textarea = createTextarea('a()b', 2);
+    const editor = new MarkdownEditor(textarea, () => {});
+    let prevented = false;
+    editor.handleKeydown(keyEvent('Backspace', { preventDefault() { prevented = true; } }));
+    assert.equal(prevented, true);
+    assert.equal(textarea.value, 'ab');
+    assert.equal(textarea.selectionStart, 1);
+});
+
+test('Shift+Enter não continua a lista', () => {
+    const textarea = createTextarea('- item', 6);
+    const editor = new MarkdownEditor(textarea, () => {});
+    let prevented = false;
+    editor.handleKeydown(keyEvent('Enter', { shiftKey: true, preventDefault() { prevented = true; } }));
+    assert.equal(prevented, false);
+    assert.equal(textarea.value, '- item');
+});
+
+test('ignora atalhos e auto-pares durante composição de IME', () => {
+    const textarea = createTextarea('', 0);
+    const editor = new MarkdownEditor(textarea, () => {});
+    let prevented = false;
+    editor.handleKeydown(keyEvent('(', { isComposing: true, preventDefault() { prevented = true; } }));
+    assert.equal(prevented, false);
+    assert.equal(textarea.value, '');
+});
+
 test('caps undo history for very large documents', () => {
     const block = 'x'.repeat(1_000_000);
     const textarea = createTextarea(block);
@@ -135,7 +294,7 @@ test('caps undo history for very large documents', () => {
     }
     assert.ok(editor.historyChars <= 16 * 1024 * 1024);
     assert.ok(editor.history.length <= 20);
-    assert.equal(editor.history[editor.historyIndex], textarea.value);
+    assert.equal(editor.history[editor.historyIndex].value, textarea.value);
     assert.ok(editor.historyIndex > 0);
     editor.undo();
     assert.notEqual(textarea.value, `${block}24`);
@@ -409,4 +568,31 @@ test('highlights Markdown structures and identifies fenced code languages', () =
         if (original === undefined) delete globalThis.hljs;
         else globalThis.hljs = original;
     }
+});
+
+test('decide quando o overlay de sintaxe deve sair de cena em notas grandes', () => {
+    assert.equal(shouldRenderEditorHighlight(1_000), true);
+    assert.equal(shouldRenderEditorHighlight(EDITOR_HIGHLIGHT_LIMITS.plainWhileTyping + 1, { typing: true }), false);
+    // Fora da digitação a nota grande ainda recebe realce.
+    assert.equal(shouldRenderEditorHighlight(EDITOR_HIGHLIGHT_LIMITS.plainWhileTyping + 1), true);
+    assert.equal(shouldRenderEditorHighlight(EDITOR_HIGHLIGHT_LIMITS.maxLive + 1), false);
+    assert.equal(shouldRenderEditorHighlight(EDITOR_HIGHLIGHT_LIMITS.maxLive + 1, { typing: true }), false);
+});
+
+test('o realce preserva o texto exato para manter seleção e cursor alinhados', () => {
+    const source = [
+        '# Título com TODO',
+        '',
+        '```javascript',
+        'const answer = 42; // FIXME depois',
+        '```',
+        '',
+        'Texto **forte**, *ênfase*, `código`, [[link]] e < > & fim.'
+    ].join('\n');
+    const plain = highlightMarkdown(source)
+        .replace(/<[^>]+>/g, '')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&amp;', '&');
+    assert.equal(plain, source);
 });

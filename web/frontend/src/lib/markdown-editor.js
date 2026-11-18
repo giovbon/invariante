@@ -14,7 +14,11 @@ function replaceSelection(value, start, end, before, after = before, placeholder
 
 function changeLines(value, start, end, transform) {
     const lineStart = value.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
-    const lineEndIndex = value.indexOf('\n', end);
+    // A selection that ends right after a line break (i.e. at the start of the
+    // next line) must not transform that next line. Searching from `end - 1`
+    // makes the trailing newline the end of the block in that case.
+    const endsAtLineStart = end > start && (end === 0 || value[end - 1] === '\n');
+    const lineEndIndex = value.indexOf('\n', endsAtLineStart ? end - 1 : end);
     const lineEnd = lineEndIndex < 0 ? value.length : lineEndIndex;
     const lines = value.slice(lineStart, lineEnd).split('\n');
     let removedFromFirst = 0;
@@ -69,24 +73,62 @@ export function indentSelection(value, start, end, outdent = false) {
 
 const maxHistoryEntries = 200;
 const maxHistoryChars = 16 * 1024 * 1024;
+// A digitação contínua vira um único passo de undo; colar, recortar, arrastar
+// ou trocar o cursor sempre começa um passo novo.
+const historyCoalesceWindowMs = 500;
+const deleteInputTypes = new Set([
+    'deleteContentBackward', 'deleteContentForward',
+    'deleteWordBackward', 'deleteWordForward',
+    'deleteSoftLineBackward', 'deleteSoftLineForward',
+    'deleteHardLineBackward', 'deleteHardLineForward'
+]);
+const pairClosers = Object.freeze({ '(': ')', '[': ']', '{': '}', '"': '"', "'": "'" });
+const closingPairKeys = new Set(Object.values(pairClosers));
+const inlineMarkers = ['*', '_', '`'];
+
+function historySnapshot(textarea) {
+    return {
+        value: textarea.value,
+        start: textarea.selectionStart,
+        end: textarea.selectionEnd,
+        scrollTop: textarea.scrollTop ?? 0,
+        scrollLeft: textarea.scrollLeft ?? 0
+    };
+}
+
+function clampIndex(value, index) {
+    const number = Number(index);
+    if (!Number.isFinite(number)) return 0;
+    return Math.max(0, Math.min(number, value.length));
+}
 
 export class MarkdownEditor {
     constructor(textarea, onChange, onHistoryChange = () => {}) {
         this.textarea = textarea;
         this.onChange = onChange;
         this.onHistoryChange = onHistoryChange;
-        this.history = [textarea.value];
+        this.history = [historySnapshot(textarea)];
         this.historyChars = textarea.value.length;
         this.historyIndex = 0;
         this.lastInputAt = 0;
+        this.lastInputKind = '';
+        this.composing = false;
+    }
+
+    get currentEntry() {
+        return this.history[this.historyIndex];
     }
 
     setValue(value, { silent = false } = {}) {
         this.textarea.value = value;
-        this.history = [value];
+        const snapshot = historySnapshot(this.textarea);
+        snapshot.start = clampIndex(value, snapshot.start);
+        snapshot.end = clampIndex(value, Math.max(snapshot.start, snapshot.end));
+        this.history = [snapshot];
         this.historyChars = value.length;
         this.historyIndex = 0;
         this.lastInputAt = 0;
+        this.lastInputKind = '';
         this.notifyHistory();
         if (!silent) this.onChange(value);
     }
@@ -95,41 +137,81 @@ export class MarkdownEditor {
     // true quando o texto foi alterado; quem chama decide como registrar.
     expandSnippet(now = new Date()) {
         const { selectionStart, selectionEnd } = this.textarea;
-        if (selectionStart !== selectionEnd) return false;
+        if (this.composing || selectionStart !== selectionEnd) return false;
         const match = matchSnippet(this.textarea.value, selectionStart, now);
         if (!match) return false;
         const value = this.textarea.value;
+        const scrollTop = this.textarea.scrollTop ?? 0;
+        const scrollLeft = this.textarea.scrollLeft ?? 0;
         this.textarea.value = `${value.slice(0, match.start)}${match.text}${value.slice(selectionStart)}`;
         const caret = match.start + (match.selectStart ?? match.text.length);
         const caretEnd = match.start + (match.selectEnd ?? match.text.length);
         this.textarea.setSelectionRange(caret, caretEnd);
+        // Assigning `value` and moving the caret can reset the viewport; the
+        // snippet is typed in place, so the user must stay where they were.
+        this.textarea.scrollTop = scrollTop;
+        this.textarea.scrollLeft = scrollLeft;
         return true;
     }
 
-    handleInput() {
-        // A expansão acontece antes de registrar o histórico, então o undo
-        // volta para o texto digitado e o preview recebe o valor final.
-        if (this.expandSnippet()) this.lastInputAt = 0;
+    // O evento `input` informa o tipo da alteração. Colar conteúdo não deve
+    // expandir snippets nem entrar no mesmo passo de undo da digitação
+    // seguinte — era isso que fazia o undo "engolir" o texto colado.
+    handleInput(event = {}) {
+        const inputType = typeof event === 'string' ? event : event.inputType || '';
+        // Durante composição (acentos mortos, IME) o navegador ainda está
+        // montando o texto. O preview acompanha, mas o histórico espera o fim.
+        if (this.composing) {
+            this.lastInputAt = 0;
+            this.lastInputKind = '';
+            this.notifyHistory();
+            this.onChange(this.textarea.value);
+            return;
+        }
+        const composingInput = inputType === 'insertCompositionText';
+        const typing = !inputType || composingInput || inputType === 'insertText' ||
+            inputType === 'insertReplacementText';
+        const deleting = !inputType || deleteInputTypes.has(inputType);
+        if (typing && !composingInput && this.expandSnippet()) {
+            this.lastInputAt = 0;
+            this.lastInputKind = '';
+        }
         const value = this.textarea.value;
-        if (this.history[this.historyIndex] !== value) {
+        if (this.currentEntry.value !== value) {
+            const kind = typing ? 'type' : deleting ? 'delete' : '';
             const now = Date.now();
-            if (this.historyIndex < this.history.length - 1) {
-                this.dropFutureHistory();
-            }
-            if (now - this.lastInputAt < 500 && this.historyIndex > 0) {
-                const previous = this.history[this.historyIndex];
-                this.historyChars += value.length - previous.length;
-                this.history[this.historyIndex] = value;
+            const coalesce = Boolean(kind) && kind === this.lastInputKind &&
+                now - this.lastInputAt < historyCoalesceWindowMs && this.historyIndex > 0;
+            if (this.historyIndex < this.history.length - 1) this.dropFutureHistory();
+            const snapshot = historySnapshot(this.textarea);
+            if (coalesce) {
+                const entry = this.currentEntry;
+                this.historyChars += value.length - entry.value.length;
+                Object.assign(entry, snapshot);
             } else {
-                this.history.push(value);
+                this.history.push(snapshot);
                 this.historyChars += value.length;
                 this.historyIndex++;
             }
             this.lastInputAt = now;
+            this.lastInputKind = kind;
             this.trimHistory();
         }
         this.notifyHistory();
         this.onChange(value);
+    }
+
+    handleCompositionStart() {
+        this.composing = true;
+        this.lastInputAt = 0;
+        this.lastInputKind = '';
+    }
+
+    handleCompositionEnd() {
+        if (!this.composing) return;
+        this.composing = false;
+        // Registra o texto composto como um passo próprio do histórico.
+        this.handleInput({ inputType: 'insertText' });
     }
 
     getWikilinkToken() {
@@ -162,14 +244,21 @@ export class MarkdownEditor {
     }
 
     apply(result) {
+        const scrollTop = this.textarea.scrollTop ?? 0;
+        const scrollLeft = this.textarea.scrollLeft ?? 0;
         this.textarea.value = result.value;
         this.textarea.focus();
         this.textarea.setSelectionRange(result.start, result.end);
-        this.dropFutureHistory();
-        this.history.push(result.value);
+        // `setSelectionRange` rola até o cursor. Preservar o viewport evita
+        // saltos quando o comando é aplicado no texto que já está à vista.
+        this.textarea.scrollTop = scrollTop;
+        this.textarea.scrollLeft = scrollLeft;
+        if (this.historyIndex < this.history.length - 1) this.dropFutureHistory();
+        this.history.push(historySnapshot(this.textarea));
         this.historyChars += result.value.length;
         this.historyIndex++;
         this.lastInputAt = 0;
+        this.lastInputKind = '';
         this.trimHistory();
         this.notifyHistory();
         this.onChange(result.value);
@@ -213,6 +302,9 @@ export class MarkdownEditor {
     }
 
     handleKeydown(event) {
+        // Nunca interfere na composição de acentos/IME: o navegador ainda vai
+        // combinar a tecla com o caractere seguinte.
+        if (event.isComposing || event.keyCode === 229) return;
         const mod = event.ctrlKey || event.metaKey;
         if (mod && event.key.toLowerCase() === 'z') {
             event.preventDefault();
@@ -254,30 +346,64 @@ export class MarkdownEditor {
             this.apply(indentSelection(this.textarea.value, selectionStart, selectionEnd, event.shiftKey));
             return;
         }
-        if (event.key === 'Enter' && this.continueMarkdownList()) {
+        // Shift+Enter continua sendo uma quebra de linha dentro do item.
+        if (event.key === 'Enter' && !mod && !event.shiftKey && !event.altKey && this.continueMarkdownList()) {
             event.preventDefault();
             return;
         }
-        const pairs = { '(': ')', '[': ']', '{': '}', '"': '"', "'": "'" };
-        const inlineMarkers = ['*', '_', '`'];
         const { selectionStart, selectionEnd, value } = this.textarea;
-        if (selectionStart !== selectionEnd && inlineMarkers.includes(event.key)) {
+        const key = event.key;
+
+        if (key === 'Backspace' && !mod && !event.altKey && selectionStart === selectionEnd && selectionStart > 0) {
+            // Backspace entre um par vazio remove os dois lados de uma vez.
+            const opener = value[selectionStart - 1];
+            if (pairClosers[opener] === value[selectionStart]) {
+                event.preventDefault();
+                this.apply({
+                    value: `${value.slice(0, selectionStart - 1)}${value.slice(selectionStart + 1)}`,
+                    start: selectionStart - 1,
+                    end: selectionStart - 1
+                });
+                return;
+            }
+        }
+
+        if (selectionStart !== selectionEnd && inlineMarkers.includes(key)) {
             event.preventDefault();
-            this.apply(replaceSelection(value, selectionStart, selectionEnd, event.key));
-        } else if (pairs[event.key] && selectionStart !== selectionEnd) {
+            this.apply(replaceSelection(value, selectionStart, selectionEnd, key));
+            return;
+        }
+        if (selectionStart !== selectionEnd && pairClosers[key]) {
             event.preventDefault();
-            this.apply(replaceSelection(value, selectionStart, selectionEnd, event.key, pairs[event.key]));
-        } else if (pairs[event.key] && selectionStart === selectionEnd) {
+            this.apply(replaceSelection(value, selectionStart, selectionEnd, key, pairClosers[key]));
+            return;
+        }
+        if (selectionStart !== selectionEnd) return;
+
+        const next = value[selectionStart];
+        if ((key === '"' || key === "'") && next === key) {
+            // Aspas já fechadas: atravessa em vez de duplicar ("" -> ").
+            event.preventDefault();
+            this.textarea.setSelectionRange(selectionStart + 1, selectionStart + 1);
+            return;
+        }
+        if (closingPairKeys.has(key) && next === key) {
+            // Fechamento existente: apenas atravessa, sem inserir duplicado.
+            event.preventDefault();
+            this.textarea.setSelectionRange(selectionStart + 1, selectionStart + 1);
+            return;
+        }
+        if (pairClosers[key]) {
+            const previous = value[selectionStart - 1] || '';
+            // Não fecha aspas depois de uma letra/número (don't, d'água) nem
+            // depois de uma barra de escape.
+            if (previous === '\\' || ((key === '"' || key === "'") && /[\p{L}\p{N}]/u.test(previous))) return;
             event.preventDefault();
             this.apply({
-                value: `${value.slice(0, selectionStart)}${event.key}${pairs[event.key]}${value.slice(selectionEnd)}`,
+                value: `${value.slice(0, selectionStart)}${key}${pairClosers[key]}${value.slice(selectionEnd)}`,
                 start: selectionStart + 1,
                 end: selectionStart + 1
             });
-        } else if ([')', ']', '}', '"', "'"].includes(event.key) &&
-            value[selectionStart] === event.key && selectionStart === selectionEnd) {
-            event.preventDefault();
-            this.textarea.setSelectionRange(selectionStart + 1, selectionStart + 1);
         }
     }
 
@@ -330,7 +456,7 @@ export class MarkdownEditor {
 
     dropFutureHistory() {
         for (let index = this.historyIndex + 1; index < this.history.length; index++) {
-            this.historyChars -= this.history[index].length;
+            this.historyChars -= this.history[index].value.length;
         }
         this.history = this.history.slice(0, this.historyIndex + 1);
     }
@@ -339,7 +465,7 @@ export class MarkdownEditor {
         while (this.history.length > maxHistoryEntries ||
             (this.historyChars > maxHistoryChars && this.history.length > 1 && this.historyIndex > 0)) {
             const removed = this.history.shift();
-            this.historyChars -= removed.length;
+            this.historyChars -= removed.value.length;
             this.historyIndex = Math.max(0, this.historyIndex - 1);
         }
     }
@@ -357,11 +483,19 @@ export class MarkdownEditor {
     }
 
     restoreHistory() {
-        const value = this.history[this.historyIndex];
+        const entry = this.currentEntry;
+        const value = entry.value;
         this.textarea.value = value;
         this.textarea.focus();
-        this.textarea.setSelectionRange(value.length, value.length);
+        // Desfazer/refazer devolve também a seleção e a rolagem do passo
+        // correspondente, em vez de jogar o cursor para o fim da nota.
+        const start = clampIndex(value, entry.start);
+        const end = clampIndex(value, entry.end);
+        this.textarea.setSelectionRange(start, Math.max(start, end));
+        this.textarea.scrollTop = entry.scrollTop ?? 0;
+        this.textarea.scrollLeft = entry.scrollLeft ?? 0;
         this.lastInputAt = 0;
+        this.lastInputKind = '';
         this.notifyHistory();
         this.onChange(value);
     }
@@ -376,6 +510,21 @@ export class MarkdownEditor {
 
 function escapeHTML(source) {
     return source.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+// Limites do realce ao vivo do modo de edição. Montar o overlay é caro em
+// notas grandes; acima de `plainWhileTyping` ele é escondido enquanto o texto
+// está sendo alterado (o textarea nativo aparece, sem atraso de cursor) e volta
+// depois de uma pausa. Acima de `maxLive` ele não é gerado.
+export const EDITOR_HIGHLIGHT_LIMITS = Object.freeze({
+    plainWhileTyping: 60_000,
+    maxLive: 300_000
+});
+
+export function shouldRenderEditorHighlight(length, { typing = false } = {}) {
+    if (length > EDITOR_HIGHLIGHT_LIMITS.maxLive) return false;
+    if (typing && length > EDITOR_HIGHLIGHT_LIMITS.plainWhileTyping) return false;
+    return true;
 }
 
 export const DEFAULT_TASK_MARKERS = ['TODO', 'FIXME', 'HACK', 'XXX', 'BUG', 'NOTE'];

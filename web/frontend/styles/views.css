@@ -678,6 +678,22 @@
         -webkit-text-fill-color: var(--faint);
     }
 
+    /* Notas grandes: durante a digitação/cola o overlay é escondido e o texto
+       nativo do textarea aparece. Assim não existe camada visual atrasada em
+       relação à seleção e ao cursor. */
+    .source-editor.is-plain-text .source-highlight {
+        visibility: hidden;
+    }
+
+    .source-editor.is-plain-text textarea {
+        color: var(--text);
+        -webkit-text-fill-color: currentColor;
+    }
+
+    .source-editor.is-plain-text textarea::selection {
+        color: var(--text);
+    }
+
     .markdown-preview {
         min-height: 0;
         flex: 1;
@@ -1127,12 +1143,15 @@
         color: var(--syntax-code);
     }
 
+    /* O overlay de sintaxe fica exatamente sobre o textarea transparente. Estes
+       realces só podem mudar cor/decoração: padding, font-size ou margem
+       deslocam os glifos e desalinham a seleção nativa e o cursor. Para dar a
+       impressão de preenchimento, use box-shadow (não participa do layout). */
     .md-code-language {
         border-radius: 3px;
-        padding: 0 3px;
         color: var(--syntax-language);
         background: color-mix(in srgb, var(--syntax-language) 12%, transparent);
-        font-size: .9em;
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--syntax-language) 12%, transparent);
     }
 
     .md-strong {
@@ -1152,9 +1171,9 @@
 
     .md-task-marker {
         border-radius: 3px;
-        padding: 0 2px;
         color: var(--syntax-strong);
         background: color-mix(in srgb, var(--syntax-strong) 14%, transparent);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--syntax-strong) 14%, transparent);
         font-weight: 700;
     }
 
