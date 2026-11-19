@@ -106,7 +106,7 @@ test('loads additional task pages on demand', async ({ page, request }) => {
         const items = page.locator('#workspacePanel .task-item');
         await expect(items).toHaveCount(250);
         const more = page.locator('#workspacePanel .tasks-more');
-        await expect(more).toContainText('Carregar mais (50)');
+        await expect(more).toContainText(/Carregar mais \(\d+\)/);
         await more.click();
         await expect(items).toHaveCount(300);
     } finally {

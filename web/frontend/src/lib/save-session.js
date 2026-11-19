@@ -74,13 +74,17 @@ function scheduleSave() {
     state.saveTimer = window.setTimeout(() => void persistDraft(), 650);
 }
 
-async function persistDraft() {
+async function persistDraft(force = false) {
     if (state.savePromise) {
         await state.savePromise;
         return isDraftDirty() ? persistDraft() : true;
     }
     const draft = getDraft();
-    if (!isDraftDirty(draft)) return true;
+    // Normally an unchanged draft needs no request. Uploading an attachment to
+    // a brand-new note is the exception: the note must exist on the server
+    // before it can own a file, even when the draft still matches the
+    // auto-generated title.
+    if (!isDraftDirty(draft) && !(force && state.noteID === null)) return true;
     const note = {
         title: draft.title.trim(),
         folder: draft.folder,
@@ -160,8 +164,13 @@ async function persistDraft() {
                 state.folderNotes.clear();
                 void loadFolderNotes('', false);
             }
+            if (metadataChanged && state.noteID !== null) {
+                // Incoming backlinks depend on this note's title and folder,
+                // not on its body. Reloading them after every autosave of the
+                // content forced a full scan of note_links while typing.
+                void sidePanels.loadBacklinks(state.noteID);
+            }
             if (contentChanged) {
-                if (state.noteID !== null) void sidePanels.loadBacklinks(state.noteID);
                 tasksPanel.scheduleRefresh();
             }
             if (tagsChanged) void loadTags();
@@ -181,19 +190,20 @@ async function persistDraft() {
     return result;
 }
 
-async function flushSave() {
+async function flushSave({ create = false } = {}) {
     window.clearTimeout(state.saveTimer);
     while (state.savePromise) {
         await state.savePromise;
         if (state.savePromise) continue;
     }
-    if (!isDraftDirty()) return true;
+    const forceCreate = create && state.noteID === null;
+    if (!isDraftDirty() && !forceCreate) return true;
     if (!elements.noteTitle.value.trim()) {
         setSaveStatus('Informe um título antes de sair', 'error');
         elements.noteTitle.focus();
         return false;
     }
-    const success = await persistDraft();
+    const success = await persistDraft(forceCreate);
     if (!success) return false;
     if (isDraftDirty()) return flushSave();
     return true;

@@ -8,6 +8,7 @@ import { tablePropertyKeys } from './lib/table-data.js';
 import { createTableView } from './lib/table-view.js';
 import { createSidePanels } from './lib/side-panels.js';
 import { createTasksPanel } from './lib/tasks-panel.js';
+import { createAgendaPanel } from './lib/agenda-panel.js';
 import { createSettingsPanel } from './lib/settings-panel.js';
 import { createNoteListView, skeletonLines } from './lib/note-list.js';
 import { createFolderTree } from './lib/folder-tree.js';
@@ -117,6 +118,7 @@ const elements = {
     backlinksCount: document.querySelector('#backlinksCount'),
     outlineCount: document.querySelector('#outlineCount'),
     tasksCount: document.querySelector('#tasksCount'),
+    agendaCount: document.querySelector('#agendaCount'),
     currentFolder: document.querySelector('#currentFolder'),
     noteTitle: document.querySelector('#noteTitle'),
     noteContent: document.querySelector('#noteContent'),
@@ -130,6 +132,9 @@ const elements = {
     attachmentsDialog: document.querySelector('#attachmentsDialog'),
     attachmentsButton: document.querySelector('#attachmentsButton'),
     attachmentInput: document.querySelector('#attachmentInput'),
+    attachmentPhotoInput: document.querySelector('#attachmentPhotoInput'),
+    addAttachment: document.querySelector('#addAttachment'),
+    addAttachmentPhoto: document.querySelector('#addPhoto'),
     attachmentList: document.querySelector('#attachmentList'),
     attachmentsEmpty: document.querySelector('#attachmentsEmpty'),
     editorWorkspace: document.querySelector('.editor-workspace'),
@@ -165,10 +170,19 @@ const tasksPanel = createTasksPanel({
 const settingsPanel = createSettingsPanel({
     state,
     elements,
+    requestJSON,
+    showMessage,
     saveMarkers: tasksPanel.saveMarkers,
     exportBackup,
     importMarkdownNotes,
     defaultTaskMarkers: DEFAULT_TASK_MARKERS
+});
+
+const agendaPanel = createAgendaPanel({
+    elements,
+    requestJSON,
+    showMessage,
+    skeletonLines
 });
 
 const sidePanels = createSidePanels({
@@ -458,7 +472,7 @@ async function initialize() {
     setupEventListeners();
     folderTree.setupChangeEvents();
     setupTheme();
-    tableView.loadColumnPreferences();
+    await tableView.loadColumnPreferences();
     const savedPanelWidth = Number(localStorage.getItem('workspacePanelWidth'));
     if (Number.isFinite(savedPanelWidth) && savedPanelWidth > 0) workspacePanelWidth = savedPanelWidth;
     setWorkspacePanelWidth(workspacePanelWidth);
@@ -485,7 +499,21 @@ async function initialize() {
     loadFolders();
     loadTags();
     void loadFolderNotes('', false);
-    void tasksPanel.loadMarkers().finally(() => void tasksPanel.load());
+    void tasksPanel.loadMarkers();
+    // Counting tasks scans every note. It only feeds the sidebar badge, so let
+    // the first screen settle and skip the scan if the panel was opened first.
+    scheduleIdleWork(() => {
+        if (state.tasks === null && !state.tasksLoading) void tasksPanel.load();
+    });
+    void agendaPanel.load();
+}
+
+function scheduleIdleWork(callback) {
+    if (typeof window.requestIdleCallback === 'function') {
+        window.requestIdleCallback(callback, { timeout: 2500 });
+        return;
+    }
+    window.setTimeout(callback, 1500);
 }
 
 function setupEventListeners() {
@@ -572,12 +600,15 @@ function setupEventListeners() {
         elements.attachmentsDialog.close();
         elements.attachmentsButton.focus();
     });
-    document.querySelector('#addAttachment').addEventListener('click', () => elements.attachmentInput.click());
-    elements.attachmentInput.addEventListener('change', event => {
-        const files = [...event.target.files];
-        event.target.value = '';
-        if (files.length) void uploadAttachments(files);
-    });
+    elements.addAttachment.addEventListener('click', () => elements.attachmentInput.click());
+    elements.addAttachmentPhoto.addEventListener('click', () => elements.attachmentPhotoInput.click());
+    for (const input of [elements.attachmentInput, elements.attachmentPhotoInput]) {
+        input.addEventListener('change', event => {
+            const files = [...event.target.files];
+            event.target.value = '';
+            if (files.length) void uploadAttachments(files);
+        });
+    }
     elements.attachmentList.addEventListener('click', event => {
         const button = event.target.closest('[data-delete-attachment]');
         if (button) void deleteAttachment(Number(button.dataset.deleteAttachment));
@@ -1775,31 +1806,75 @@ function renderAttachments(attachments, noteID) {
     positionAttachmentsDialog();
 }
 
+const maxAttachmentBytes = 25 * 1024 * 1024;
+
+function attachmentFilename(file) {
+    const name = (file.name || '').trim();
+    if (name) return name;
+    // Android pickers sometimes hand back a file without a name. Without one
+    // the server rejects the upload, so synthesize one from the MIME type.
+    const subtype = (file.type || '').split('/')[1] || '';
+    const extension = subtype.replace(/[^a-z0-9]/gi, '') || 'bin';
+    return `anexo-${Date.now()}.${extension}`;
+}
+
+function setAttachmentUploading(uploading) {
+    for (const button of [elements.addAttachment, elements.addAttachmentPhoto]) {
+        if (!button) continue;
+        button.disabled = uploading;
+    }
+    const submit = elements.addAttachment;
+    if (submit) submit.textContent = uploading ? 'Enviando…' : 'Enviar arquivos';
+}
+
 async function uploadAttachments(files) {
-    if (!(await saveSession.flush()) || state.noteID === null) return;
+    if (!files.length || state.view !== 'editor') return;
+    // A brand-new note only exists in the browser until it is saved. Force the
+    // first save so the attachment has a note to belong to; otherwise the
+    // upload was silently dropped.
+    if (!(await saveSession.flush({ create: true })) || state.noteID === null) {
+        if (state.noteID === null) {
+            showMessage('Não foi possível criar a nota antes de enviar o anexo. Informe um título e tente novamente.', 'error');
+        }
+        return;
+    }
     const noteID = state.noteID;
-    for (const file of files) {
-        const form = new FormData();
-        form.append('file', file, file.name);
-        try {
-            const response = await fetch(`/api/notes/${noteID}/attachments`, { method: 'POST', body: form });
-            if (response.status === 401) {
-                location.replace('/login.html');
+    setAttachmentUploading(true);
+    try {
+        for (const file of files) {
+            if (file.size > maxAttachmentBytes) {
+                showMessage(`${attachmentFilename(file)} tem ${formatFileSize(file.size)}; o limite por anexo é ${formatFileSize(maxAttachmentBytes)}.`, 'error');
+                continue;
+            }
+            const form = new FormData();
+            form.append('file', file, attachmentFilename(file));
+            try {
+                const response = await fetch(`/api/notes/${noteID}/attachments`, { method: 'POST', body: form });
+                if (response.status === 401) {
+                    location.replace('/login.html');
+                    return;
+                }
+                if (!response.ok) {
+                    if (response.status === 413) {
+                        throw new Error(`arquivo maior que o limite de ${formatFileSize(maxAttachmentBytes)}`);
+                    }
+                    throw new Error((await response.text()).trim() || `HTTP ${response.status}`);
+                }
+                const attachment = await response.json();
+                if (state.noteID === noteID) {
+                    insertAttachmentMarkdown(attachment);
+                    tableView.invalidate();
+                    await loadAttachments(noteID);
+                }
+            } catch (error) {
+                showMessage(`Não foi possível enviar ${attachmentFilename(file)}: ${error.message}`, 'error');
                 return;
             }
-            if (!response.ok) throw new Error((await response.text()).trim() || `HTTP ${response.status}`);
-            const attachment = await response.json();
-            if (state.noteID === noteID) {
-                insertAttachmentMarkdown(attachment);
-                tableView.invalidate();
-                await loadAttachments(noteID);
-            }
-        } catch (error) {
-            showMessage(`Não foi possível enviar ${file.name}: ${error.message}`, 'error');
-            return;
         }
+        if (state.noteID === noteID) await saveSession.flush();
+    } finally {
+        setAttachmentUploading(false);
     }
-    if (state.noteID === noteID) await saveSession.flush();
 }
 
 function insertAttachmentMarkdown(attachment) {
@@ -2086,6 +2161,10 @@ function togglePanel(name) {
         elements.panelTitle.textContent = 'Tarefas';
         tasksPanel.render();
         void tasksPanel.load();
+    } else if (name === 'agenda') {
+        elements.panelTitle.textContent = 'Agenda';
+        agendaPanel.render();
+        void agendaPanel.load().finally(() => agendaPanel.focus());
     } else if (name === 'settings') {
         settingsPanel.render();
     } else {

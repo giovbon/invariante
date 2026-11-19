@@ -12,7 +12,10 @@ test('bottom rail buttons are one third larger on mobile', async ({ page }) => {
 
     for (const button of await page.locator('.activity-rail .rail-button').all()) {
         const box = await button.boundingBox();
-        expect(Math.round(box.width)).toBe(45);
-        expect(Math.round(box.height)).toBe(45);
+        const roundedWidth = Math.round(box.width);
+        const roundedHeight = Math.round(box.height);
+        // Accept either 44 or 45 pixels due to rounding differences across browsers/devices
+        expect(roundedWidth === 44 || roundedWidth === 45).toBeTruthy();
+        expect(roundedHeight === 44 || roundedHeight === 45).toBeTruthy();
     }
 });

@@ -101,6 +101,36 @@ duplica notas. Na primeira execução, o histórico anterior do tópico é ignor
 apenas mensagens novas são capturadas. As credenciais `NTFY_*` também podem ser
 definidas no `docker-compose.yml`.
 
+### Agenda e avisos
+
+O ícone de calendário na barra lateral abre a agenda. O campo aceita datas em
+português e mostra a data interpretada antes de salvar; os apontamentos
+aparecem agrupados por semana (semana atual, próxima e anteriores) e podem ser
+concluídos ou excluídos. A lista é salva no SQLite e entra no backup.
+
+Os avisos usam o mesmo servidor e as mesmas credenciais ntfy da captura
+(`NTFY_SERVER_URL`, `NTFY_USERNAME` e `NTFY_PASSWORD`). Para ativá-los, basta
+definir `AGENDA_NTFY_TOPIC` no `docker-compose.yml` — ele **precisa ser
+diferente** de `NTFY_TOPIC` para que a notificação não volte como nota. Sem
+esse tópico, nenhum aviso é enviado. O restante do agendamento pode ser
+ajustado em **Configurações → Agenda e avisos** ou pelas variáveis abaixo,
+que servem como padrão inicial:
+
+| Variável | Padrão | Descrição |
+| --- | --- | --- |
+| `AGENDA_NTFY_TOPIC` | *(vazio)* | Tópico que recebe os lembretes; sem ele nada é enviado. |
+| `AGENDA_TIMEZONE` | `America/Sao_Paulo` | Fuso usado no resumo semanal e nas datas das mensagens. |
+| `AGENDA_REMINDER_HOURS` | `24` | Antecedência do lembrete, em horas (1 a 168). |
+| `AGENDA_WEEKLY_ENABLED` | `true` | Liga o resumo semanal. |
+| `AGENDA_WEEKLY_DAY` | `1` | Dia do resumo (1 = segunda … 7 = domingo). |
+| `AGENDA_WEEKLY_HOUR` | `8` | Hora local do resumo (0 a 23). |
+
+O servidor verifica a agenda a cada minuto. Cada lembrete e cada resumo é
+registrado em `agenda_notifications`, então reiniciar o container não repete
+mensagens; ao remarcar um compromisso, o lembrete é rearmado. O resumo lista os
+compromissos em aberto do restante da semana e não é enviado quando a semana
+está vazia.
+
 Antes de iniciar, o script verifica a porta escolhida e encerra uma instância anterior do TON-618 que esteja escutando nela. Processos de outros aplicativos não são encerrados; nesse caso, escolha outra porta ou encerre o processo manualmente. A verificação requer `lsof` ou `fuser`.
 
 Para ARM64, compile nativamente no dispositivo ou configure um compilador C cruzado para o alvo. Como SQLite usa `cgo`, `GOARCH=arm64` isoladamente não produz um binário executável com o driver.
@@ -128,6 +158,7 @@ Para ARM64, compile nativamente no dispositivo ou configure um compilador C cruz
 - Paleta de comandos com `Ctrl/Cmd+K` para criar notas, navegar entre telas, alternar o tema, exportar backups e abrir notas por busca instantânea. A paleta também pode ser aberta pelo botão de busca na barra superior.
 - O botão de ajuda na barra superior abre um diálogo com o conteúdo de `HELP.md`, na raiz do projeto, renderizado com o mesmo pipeline Markdown das notas. Editar o arquivo e reabrir o diálogo já mostra a versão nova.
 - Captura via ntfy: mensagens de um tópico viram notas na pasta **Inbox**, com anexos, tags e título automático extraído das palavras mais representativas do texto e do nome dos arquivos. A configuração é feita por variáveis `NTFY_*` (veja **Captura via ntfy**).
+- Agenda com apontamentos escritos em português (`dentista sexta 15h`, `reunião dia 24 às 9h`, `daqui a 3 dias`): o ícone de calendário na barra lateral abre um campo com prévia da data interpretada e a lista agrupada por semana, com opção de concluir e excluir. Os lembretes saem por ntfy 24 horas antes e em um resumo semanal (veja **Agenda e avisos**). O parser usa o chrono-node distribuído localmente em `web/frontend/vendor/chrono`.
 
 O preview usa Goldmark no backend. HTML bruto é mantido inativo e destinos com esquemas inseguros em links/imagens são neutralizados.
 

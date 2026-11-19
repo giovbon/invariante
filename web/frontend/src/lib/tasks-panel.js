@@ -92,8 +92,11 @@ function updateTasksCount() {
 }
 
 // Refreshing tasks scans every note, so autosaves coalesce into one request
-// instead of starting a full scan on each keystroke pause.
+// instead of starting a full scan on each keystroke pause. The scan also only
+// runs while the Tasks panel is visible: keeping the badge fresh while typing
+// was costing a full-library scan every few seconds.
 function scheduleTasksRefresh() {
+    if (elements.panel.dataset.panel !== 'tasks') return;
     window.clearTimeout(tasksRefreshTimer);
     tasksRefreshTimer = window.setTimeout(() => {
         tasksRefreshTimer = null;

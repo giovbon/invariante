@@ -2023,4 +2023,220 @@
             opacity: 1;
         }
     }
+
+    /* ---------- Agenda panel ---------- */
+
+    .agenda-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 10px 8px;
+    }
+
+    .agenda-form {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+
+    .agenda-input {
+        width: 100%;
+    }
+
+    .agenda-preview {
+        min-height: 1.4em;
+        margin: 0;
+        color: var(--faint);
+        font-size: var(--text-xs);
+        line-height: 1.4;
+    }
+
+    .agenda-preview[data-state="ok"] {
+        color: var(--success);
+    }
+
+    .agenda-preview[data-state="error"] {
+        color: var(--danger);
+    }
+
+    .agenda-submit {
+        width: 100%;
+    }
+
+    .agenda-list {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+    }
+
+    .agenda-summary {
+        margin: 0;
+        color: var(--faint);
+        font-size: var(--text-xs);
+    }
+
+    .agenda-divider {
+        margin: 2px 0 -6px;
+        color: var(--faint);
+        font-size: var(--text-2xs);
+        font-weight: 700;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+    }
+
+    .agenda-group {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .agenda-group.is-past {
+        opacity: .78;
+    }
+
+    .agenda-group-title {
+        margin: 0;
+        padding: 0 2px;
+        color: var(--muted);
+        font-size: var(--text-2xs);
+        font-weight: 700;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+    }
+
+    .agenda-items {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+
+    .agenda-item {
+        display: flex;
+        min-width: 0;
+        align-items: flex-start;
+        gap: 8px;
+        padding: 6px;
+        border-radius: var(--radius-sm);
+        transition: var(--transition-colors);
+    }
+
+    .agenda-item:hover,
+    .agenda-item:focus-within {
+        background: var(--surface-hover);
+    }
+
+    .agenda-item.is-done {
+        opacity: .6;
+    }
+
+    .agenda-item.is-done .agenda-item-title {
+        text-decoration: line-through;
+    }
+
+    .agenda-item.is-past .agenda-item-title {
+        color: var(--faint);
+    }
+
+    .agenda-check {
+        flex: none;
+        margin-top: 3px;
+        accent-color: var(--accent);
+    }
+
+    .agenda-item-body {
+        display: flex;
+        min-width: 0;
+        flex: 1;
+        flex-direction: column;
+        gap: 1px;
+    }
+
+    .agenda-item-title {
+        overflow-wrap: anywhere;
+        color: var(--text);
+        font-size: var(--text-sm);
+        line-height: 1.35;
+    }
+
+    .agenda-item-date {
+        color: var(--faint);
+        font-size: var(--text-2xs);
+    }
+
+    .agenda-delete {
+        display: inline-flex;
+        width: 22px;
+        height: 22px;
+        flex: none;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: 0;
+        border-radius: var(--radius-sm);
+        color: var(--faint);
+        background: transparent;
+        font-size: var(--text-base);
+        line-height: 1;
+        cursor: pointer;
+        transition: var(--transition-colors);
+    }
+
+    .agenda-delete:hover,
+    .agenda-delete:focus-visible {
+        color: var(--danger);
+        background: var(--danger-soft);
+    }
+
+    .agenda-empty {
+        display: grid;
+        gap: 6px;
+        padding: 12px 4px;
+        color: var(--muted);
+        font-size: var(--text-sm);
+        line-height: var(--leading-normal);
+    }
+
+    .agenda-empty p {
+        margin: 0;
+    }
+
+    .agenda-empty small {
+        color: var(--faint);
+        font-size: var(--text-xs);
+    }
+
+    /* ---------- Agenda settings ---------- */
+
+    .agenda-settings-form {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .settings-field {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        color: var(--muted);
+        font-size: var(--text-xs);
+    }
+
+    .settings-field small {
+        color: var(--faint);
+        font-size: var(--text-2xs);
+        line-height: 1.35;
+    }
+
+    .settings-check {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--text);
+        font-size: var(--text-sm);
+    }
+
+    .settings-check input {
+        flex: none;
+        accent-color: var(--accent);
+    }
 }

@@ -30,6 +30,17 @@ services:
       # - NTFY_PASSWORD=sua_senha
       # - NTFY_FOLDER=Inbox
       # - NTFY_TAGS=ntfy
+      # Avisos da agenda por ntfy. Basta definir o tópico abaixo; o servidor
+      # e as credenciais são reaproveitados de NTFY_SERVER_URL, NTFY_USERNAME
+      # e NTFY_PASSWORD. O tópico precisa ser diferente de NTFY_TOPIC.
+      # - AGENDA_NTFY_TOPIC=minha-agenda
+      # Ajustes opcionais do agendamento (também editáveis em
+      # Configurações → Agenda e avisos):
+      # - AGENDA_TIMEZONE=America/Sao_Paulo
+      # - AGENDA_REMINDER_HOURS=24
+      # - AGENDA_WEEKLY_ENABLED=true
+      # - AGENDA_WEEKLY_DAY=1
+      # - AGENDA_WEEKLY_HOUR=8
     volumes:
       # Persistência dos seus dados no host.
       - ./data:/app/data

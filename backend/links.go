@@ -152,6 +152,15 @@ type noteLinkIndex struct {
 	byTitle  map[string]int64
 }
 
+// noteBacklinkIndex materializes the note_links rows grouped by the note they
+// resolve to. The resolution depends only on titles and folders, so the index
+// shares the revision of noteIndex. Per-note summaries are still fetched
+// fresh because titles, folders and tags can change between revisions.
+type noteBacklinkIndex struct {
+	revision uint64
+	sources  map[int64][]int64
+}
+
 type noteGraphCache struct {
 	revision uint64
 	graph    NoteGraph
@@ -183,6 +192,61 @@ func (a *App) noteIndex() (*noteLinkIndex, error) {
 	a.linkIndex = index
 	a.cacheMu.Unlock()
 	return index, nil
+}
+
+func (a *App) backlinkIndex() (*noteBacklinkIndex, error) {
+	revision := a.currentDataRevision()
+	a.cacheMu.RLock()
+	cached := a.backlinksCache
+	a.cacheMu.RUnlock()
+	if cached != nil && cached.revision == revision {
+		return cached, nil
+	}
+	index, err := a.noteIndex()
+	if err != nil {
+		return nil, err
+	}
+	notesByID := make(map[int64]indexedNote, len(index.notes))
+	for _, note := range index.notes {
+		notesByID[note.ID] = note
+	}
+	rows, err := a.readDB.Query(`SELECT source_id, target_key FROM note_links
+		ORDER BY source_id, target_key`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sources := make(map[int64][]int64)
+	seen := make(map[[2]int64]struct{})
+	for rows.Next() {
+		var sourceID int64
+		var targetKey string
+		if err := rows.Scan(&sourceID, &targetKey); err != nil {
+			return nil, err
+		}
+		source, exists := notesByID[sourceID]
+		if !exists {
+			continue
+		}
+		targetID := resolveNoteLink(source, targetKey, index.byPath, index.byTitle)
+		if targetID == 0 || targetID == sourceID {
+			continue
+		}
+		pair := [2]int64{targetID, sourceID}
+		if _, found := seen[pair]; found {
+			continue
+		}
+		seen[pair] = struct{}{}
+		sources[targetID] = append(sources[targetID], sourceID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	built := &noteBacklinkIndex{revision: revision, sources: sources}
+	a.cacheMu.Lock()
+	a.backlinksCache = built
+	a.cacheMu.Unlock()
+	return built, nil
 }
 
 func (a *App) NoteGraph() (NoteGraph, error) {
@@ -278,48 +342,11 @@ func (a *App) Backlinks(noteID int64) ([]NoteSummary, error) {
 	if err := a.readDB.QueryRow("SELECT 1 FROM notes WHERE rowid = ?", noteID).Scan(&exists); err != nil {
 		return nil, err
 	}
-	index, err := a.noteIndex()
+	index, err := a.backlinkIndex()
 	if err != nil {
 		return nil, err
 	}
-	notesByID := make(map[int64]indexedNote, len(index.notes))
-	for _, note := range index.notes {
-		notesByID[note.ID] = note
-	}
-	rows, err := a.readDB.Query(`SELECT source_id, target_key FROM note_links
-		WHERE source_id != ? ORDER BY source_id, target_key`, noteID)
-	if err != nil {
-		return nil, err
-	}
-	backlinkIDs := make([]int64, 0)
-	seenIDs := make(map[int64]struct{})
-	for rows.Next() {
-		var sourceID int64
-		var targetKey string
-		if err := rows.Scan(&sourceID, &targetKey); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if _, found := seenIDs[sourceID]; found {
-			continue
-		}
-		source, exists := notesByID[sourceID]
-		if !exists {
-			continue
-		}
-		if resolveNoteLink(source, targetKey, index.byPath, index.byTitle) != noteID {
-			continue
-		}
-		seenIDs[sourceID] = struct{}{}
-		backlinkIDs = append(backlinkIDs, sourceID)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
+	backlinkIDs := index.sources[noteID]
 	if len(backlinkIDs) == 0 {
 		return []NoteSummary{}, nil
 	}

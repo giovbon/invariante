@@ -32,6 +32,24 @@ test('uploads, persists and deletes an attachment', async ({ page, request }) =>
     await expect(page.locator('#attachmentList')).not.toContainText('e2e.txt');
 });
 
+test('attaches a file to a brand-new note before it is saved', async ({ page }) => {
+    await page.goto('/');
+    await page.locator('#newNote').click();
+    await expect(page.locator('#noteTitle')).not.toHaveValue('');
+
+    await page.locator('#attachmentsButton').click();
+    await page.locator('#attachmentInput').setInputFiles({
+        name: 'foto.png',
+        mimeType: 'image/png',
+        buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47])
+    });
+
+    await expect(page.locator('#attachmentList')).toContainText('foto.png');
+    await expect(page.locator('#noteContent')).toHaveValue(/foto\.png/);
+    await expect(page).toHaveURL(/\?note=\d+/);
+    await expect(page.locator('#saveStatus')).toHaveText(/Salvo automaticamente/);
+});
+
 test('table view reflects an attachment deletion immediately after returning from the editor', async ({ page, request }) => {
     const note = await createNote(request, {
         title: uniqueTitle('Anexo na tabela'),

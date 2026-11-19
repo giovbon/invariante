@@ -165,19 +165,82 @@ function tableHeight() {
     return Math.max(280, Math.floor(measured || window.innerHeight - 264));
 }
 
-function loadTableColumnPreferences() {
+const tableColumnsEndpoint = '/api/table-columns';
+const tableColumnsStorageKey = 'tableHiddenProperties';
+
+function normalizeHiddenColumns(values) {
+    if (!Array.isArray(values)) return [];
+    const hidden = [];
+    const seen = new Set();
+    for (const value of values) {
+        if (typeof value !== 'string') continue;
+        const key = value.trim();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        hidden.push(key);
+    }
+    return hidden;
+}
+
+function readStoredColumnPreferences() {
     try {
-        const stored = JSON.parse(localStorage.getItem('tableHiddenProperties') || '[]');
-        state.tableHiddenProperties = new Set(
-            Array.isArray(stored) ? stored.filter(key => typeof key === 'string') : []
-        );
+        return normalizeHiddenColumns(JSON.parse(localStorage.getItem(tableColumnsStorageKey) || '[]'));
     } catch {
-        state.tableHiddenProperties = new Set();
+        return [];
+    }
+}
+
+// localStorage keeps a small offline mirror; the server is the source of
+// truth so every browser sees the same columns.
+function writeStoredColumnPreferences(hidden) {
+    try {
+        localStorage.setItem(tableColumnsStorageKey, JSON.stringify(hidden));
+    } catch {
+        // Private mode or a full quota should not break the table.
+    }
+}
+
+let columnSaveChain = Promise.resolve();
+
+async function loadTableColumnPreferences() {
+    const stored = readStoredColumnPreferences();
+    try {
+        const payload = await requestJSON(tableColumnsEndpoint);
+        const hidden = normalizeHiddenColumns(payload?.hidden);
+        if (!payload?.configured && stored.length) {
+            // Migrate the selection made before the preference moved to the
+            // server, then keep using it until the save completes.
+            state.tableHiddenProperties = new Set(stored);
+            saveTableColumnPreferences();
+            return;
+        }
+        state.tableHiddenProperties = new Set(hidden);
+        writeStoredColumnPreferences(hidden);
+    } catch {
+        // An older server or a temporary failure should still leave the table
+        // usable with the last selection known by this browser.
+        state.tableHiddenProperties = new Set(stored);
     }
 }
 
 function saveTableColumnPreferences() {
-    localStorage.setItem('tableHiddenProperties', JSON.stringify([...state.tableHiddenProperties]));
+    const hidden = normalizeHiddenColumns([...state.tableHiddenProperties]);
+    writeStoredColumnPreferences(hidden);
+    // Serialize saves so a fast sequence of clicks cannot reach the server
+    // out of order and leave the older selection stored.
+    columnSaveChain = columnSaveChain
+        .catch(() => {})
+        .then(async () => {
+            try {
+                await requestJSON(tableColumnsEndpoint, {
+                    method: 'PUT',
+                    body: JSON.stringify({ hidden })
+                });
+            } catch (error) {
+                showMessage(`Não foi possível salvar as colunas da tabela: ${error.message}`, 'error');
+            }
+        });
+    return columnSaveChain;
 }
 
 function renderTableColumnsMenu(propertyKeys) {

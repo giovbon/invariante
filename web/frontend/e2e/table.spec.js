@@ -49,6 +49,7 @@ test.describe('Tabulator table mode', () => {
             folder,
             content: '---\nstatus: ativo\nautor: Ana\n---\n\nConteúdo.'
         });
+        await request.put('/api/table-columns', { data: { hidden: [] } });
 
         await page.goto('/');
         await page.locator(`[data-folder="${folder}"]`).click();
@@ -65,13 +66,27 @@ test.describe('Tabulator table mode', () => {
 
         await expect(statusColumn).toHaveCount(0);
         await expect(page.locator('.tabulator-col-title', { hasText: /^autor$/ })).toBeVisible();
-        expect(await page.evaluate(() => JSON.parse(localStorage.getItem('tableHiddenProperties'))))
-            .toEqual(['status']);
+        await expect.poll(async () => {
+            const response = await request.get('/api/table-columns');
+            return (await response.json()).hidden;
+        }).toEqual(['status']);
 
+        // The selection lives on the server, so a fresh browser session keeps
+        // the hidden column instead of showing the whole frontmatter again.
+        await page.reload();
+        await page.locator(`[data-folder="${folder}"]`).click();
+        await page.locator('.mode-button[data-mode="table"]').click();
+        await page.waitForSelector('.tabulator-row.is-note-row', { timeout: 10000 });
+        await expect(page.locator('.tabulator-col-title', { hasText: /^status$/ })).toHaveCount(0);
+        await expect(page.locator('.tabulator-col-title', { hasText: /^autor$/ })).toBeVisible();
+
+        await page.locator('.table-columns-toggle').click();
         await page.locator('#tableColumnsAll').click();
-        await expect(statusColumn).toBeVisible();
-        expect(await page.evaluate(() => JSON.parse(localStorage.getItem('tableHiddenProperties'))))
-            .toEqual([]);
+        await expect(page.locator('.tabulator-col-title', { hasText: /^status$/ })).toBeVisible();
+        await expect.poll(async () => {
+            const response = await request.get('/api/table-columns');
+            return (await response.json()).hidden;
+        }).toEqual([]);
     });
 
     test('edits tags and frontmatter properties directly in the table', async ({ page, request }) => {

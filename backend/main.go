@@ -122,12 +122,17 @@ type App struct {
 	cacheMu      sync.RWMutex
 	dataRevision uint64
 	linkIndex    *noteLinkIndex
-	graphCache   *noteGraphCache
-	tagsCache    *tagCountsCache
-	taskCache    []taskPageCache
-	tableCache   []tablePageCache
-	notesCache   []notesPageCache
-	searchCache  []searchPageCache
+	// backlinkIndex groups note_links by resolved target. Backlinks used to
+	// rescan and resolve every link row on each request, which costs hundreds
+	// of milliseconds in large libraries and runs again for every preview
+	// that renders a backlinks block.
+	backlinksCache *noteBacklinkIndex
+	graphCache     *noteGraphCache
+	tagsCache      *tagCountsCache
+	taskCache      []taskPageCache
+	tableCache     []tablePageCache
+	notesCache     []notesPageCache
+	searchCache    []searchPageCache
 }
 
 type folderBuilder struct {
@@ -242,6 +247,18 @@ func (a *App) Close() error {
 // markDataChanged invalidates the read caches. It is called after every
 // mutation that may change note titles, folders or links, including content
 // saves that do not need to notify the folder tree.
+// keepNoteIndexFresh advances the cached title/folder index to the current
+// revision after a save that did not change any title or folder. The index is
+// used by preview, backlinks and the graph, and rebuilding it after every
+// content autosave meant scanning the whole notes table while typing.
+func (a *App) keepNoteIndexFresh() {
+	a.cacheMu.Lock()
+	if a.linkIndex != nil {
+		a.linkIndex.revision = a.dataRevision
+	}
+	a.cacheMu.Unlock()
+}
+
 func (a *App) markDataChanged() {
 	a.cacheMu.Lock()
 	a.dataRevision++
@@ -312,6 +329,7 @@ func (a *App) migrate() error {
 		{version: 7, apply: migrateConditionalFTSTrigger},
 		{version: 8, apply: migrateDerivedNoteMetadata},
 		{version: 9, apply: migrateQueryIndexes},
+		{version: 10, apply: migrateAgenda},
 	}
 	for _, migration := range migrations {
 		var applied int
@@ -525,6 +543,35 @@ func migrateQueryIndexes(tx *sql.Tx) error {
 	statements := []string{
 		`DROP INDEX IF EXISTS idx_notes_updated`,
 		`CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at DESC, rowid DESC)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateAgenda adds the standalone agenda and the notification log that
+// keeps reminders idempotent across restarts.
+func migrateAgenda(tx *sql.Tx) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS agenda_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			title TEXT NOT NULL,
+			event_at INTEGER NOT NULL,
+			done INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_agenda_events_event_at ON agenda_events(event_at)`,
+		`CREATE TABLE IF NOT EXISTS agenda_notifications (
+			dedup_key TEXT PRIMARY KEY,
+			event_id INTEGER,
+			kind TEXT NOT NULL,
+			sent_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_agenda_notifications_event ON agenda_notifications(event_id, kind)`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.Exec(statement); err != nil {
@@ -1093,6 +1140,10 @@ func (a *App) UpdateNote(id int64, note Note) error {
 	a.markDataChanged()
 	if titleChanged || folderChanged {
 		a.notifyChange()
+	} else {
+		// The note index only stores IDs, titles and folders, so a pure
+		// content/tags save leaves it valid.
+		a.keepNoteIndexFresh()
 	}
 	return nil
 }
@@ -1547,6 +1598,9 @@ func (a *App) Handler(frontendDir string) http.Handler {
 	mux.HandleFunc("/api/tags", a.handleTags)
 	mux.HandleFunc("/api/tasks", a.handleTasks)
 	mux.HandleFunc("/api/task-markers", a.handleTaskMarkers)
+	mux.HandleFunc("/api/agenda", a.handleAgenda)
+	mux.HandleFunc("/api/agenda/", a.handleAgendaEvent)
+	mux.HandleFunc("/api/agenda-settings", a.handleAgendaSettings)
 	mux.HandleFunc("/api/backup", a.handleBackup)
 	mux.HandleFunc("/api/folders", a.handleFolders)
 	mux.HandleFunc("/api/folders/move", a.handleFolderMove)
@@ -1555,6 +1609,7 @@ func (a *App) Handler(frontendDir string) http.Handler {
 	mux.HandleFunc("/api/folder-notes", a.handleFolderNotes)
 	mux.HandleFunc("/api/events", a.handleEvents)
 	mux.HandleFunc("/api/table", a.handleTable)
+	mux.HandleFunc("/api/table-columns", a.handleTableColumns)
 	mux.HandleFunc("/api/graph", a.handleGraph)
 	mux.HandleFunc("/api/preview", a.handlePreview)
 	mux.HandleFunc("/api/help", a.handleHelp(frontendDir))
@@ -2202,6 +2257,13 @@ func main() {
 			log.Printf("HTTP shutdown: %v", err)
 		}
 	}()
+	agendaDone := make(chan struct{})
+	go func() {
+		defer close(agendaDone)
+		if err := NewAgendaNotifier(app).Run(signals); err != nil {
+			log.Printf("agenda notifier stopped: %v", err)
+		}
+	}()
 	log.Printf("TON-618 listening on http://localhost:%d", portNumber)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("serve application: %v", err)
@@ -2210,4 +2272,5 @@ func main() {
 	if ntfyDone != nil {
 		<-ntfyDone
 	}
+	<-agendaDone
 }

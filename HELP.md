@@ -96,11 +96,13 @@ Cada bloco aceita até 50 itens e a nota aceita até 20 blocos. `backlinks` e `l
 ## Tabela
 
 - O modo **Tabela** da busca mostra título, pasta, atualização e as propriedades do frontmatter.
-- O ícone de colunas permite escolher quais propriedades exibir; a escolha fica salva no navegador.
+- O ícone de colunas permite escolher quais propriedades exibir; a escolha fica salva no servidor e vale para todos os navegadores.
 
 ## Anexos
 
 - Envie arquivos pelo botão de anexos no editor (limite de 25 MiB por arquivo).
+- No celular, **Enviar foto** abre direto a galeria/câmera; **Enviar arquivos** aceita qualquer tipo.
+- Anexar em uma nota nova cria a nota automaticamente antes do envio.
 - Imagens compatíveis entram como `![nome](URL)`; outros arquivos entram como links Markdown.
 - Os arquivos ficam em `attachments/<id-da-nota>/` no diretório de dados.
 

@@ -27,6 +27,7 @@ const (
 	maxBackupManifest   = 512 << 20
 	maxBackupNotes      = 100000
 	maxBackupAttachment = maxAttachmentSize
+	maxBackupAgenda     = 100000
 )
 
 var errInvalidBackup = errors.New("invalid backup archive")
@@ -38,6 +39,16 @@ type backupManifest struct {
 	Notes       []backupNote       `json:"notes"`
 	Folders     []string           `json:"folders,omitempty"`
 	Attachments []backupAttachment `json:"attachments"`
+	// Agenda is optional so backups written before the agenda existed remain
+	// valid.
+	Agenda []backupAgendaEvent `json:"agenda,omitempty"`
+}
+
+type backupAgendaEvent struct {
+	Title     string `json:"title"`
+	EventAt   int64  `json:"event_at"`
+	Done      bool   `json:"done"`
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 type backupNote struct {
@@ -286,10 +297,40 @@ func (a *App) ExportBackup(destination io.Writer) error {
 	if err := writeJSONValue(manifestWriter, attachments); err != nil {
 		return err
 	}
+	agenda, err := loadBackupAgenda(tx)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(manifestWriter, `,"agenda":`); err != nil {
+		return err
+	}
+	if err := writeJSONValue(manifestWriter, agenda); err != nil {
+		return err
+	}
 	if _, err := io.WriteString(manifestWriter, `}`); err != nil {
 		return err
 	}
 	return archive.Close()
+}
+
+func loadBackupAgenda(tx *sql.Tx) ([]backupAgendaEvent, error) {
+	rows, err := tx.Query(`SELECT title, event_at, done, created_at
+		FROM agenda_events ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	events := make([]backupAgendaEvent, 0, 16)
+	for rows.Next() {
+		var event backupAgendaEvent
+		var done int
+		if err := rows.Scan(&event.Title, &event.EventAt, &done, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		event.Done = done != 0
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }
 
 func writeJSONValue(writer io.Writer, value any) error {
@@ -428,6 +469,14 @@ func (a *App) RestoreBackupReader(reader io.ReaderAt, size int64) (int, int, err
 	if _, err := tx.Exec("DELETE FROM folders"); err != nil {
 		return 0, 0, err
 	}
+	if _, err := tx.Exec("DELETE FROM agenda_events"); err != nil {
+		return 0, 0, err
+	}
+	// Restored events receive new IDs, so old reminder keys would point at the
+	// wrong row and could suppress notifications.
+	if _, err := tx.Exec("DELETE FROM agenda_notifications"); err != nil {
+		return 0, 0, err
+	}
 	if err := insertRestoredNotes(tx, manifest.Notes); err != nil {
 		return 0, 0, err
 	}
@@ -435,6 +484,9 @@ func (a *App) RestoreBackupReader(reader io.ReaderAt, size int64) (int, int, err
 		return 0, 0, err
 	}
 	if err := insertRestoredAttachments(tx, manifest.Attachments); err != nil {
+		return 0, 0, err
+	}
+	if err := insertRestoredAgenda(tx, manifest.Agenda); err != nil {
 		return 0, 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -586,7 +638,40 @@ func readBackupArchive(reader io.ReaderAt, size int64) (backupManifest, map[stri
 				errInvalidBackup, attachment.ID)
 		}
 	}
+	if len(manifest.Agenda) > maxBackupAgenda {
+		return backupManifest{}, nil, fmt.Errorf("%w: too many agenda events", errInvalidBackup)
+	}
+	for index := range manifest.Agenda {
+		event := &manifest.Agenda[index]
+		title, err := normalizeAgendaTitle(event.Title)
+		if err != nil {
+			return backupManifest{}, nil, fmt.Errorf("%w: agenda event %d: %v", errInvalidBackup, index, err)
+		}
+		event.Title = title
+		when := time.Unix(event.EventAt, 0).UTC()
+		if when.Year() < 1900 || when.Year() > 2200 {
+			return backupManifest{}, nil, fmt.Errorf("%w: agenda event %d has an invalid date", errInvalidBackup, index)
+		}
+	}
 	return manifest, files, nil
+}
+
+func insertRestoredAgenda(tx *sql.Tx, events []backupAgendaEvent) error {
+	for _, event := range events {
+		createdAt := strings.TrimSpace(event.CreatedAt)
+		if createdAt == "" {
+			createdAt = time.Now().UTC().Format(time.RFC3339)
+		}
+		done := 0
+		if event.Done {
+			done = 1
+		}
+		if _, err := tx.Exec(`INSERT INTO agenda_events(title, event_at, done, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)`, event.Title, event.EventAt, done, createdAt, createdAt); err != nil {
+			return fmt.Errorf("restore agenda event %q: %w", event.Title, err)
+		}
+	}
+	return nil
 }
 
 func insertRestoredFolders(tx *sql.Tx, folders []string) error {

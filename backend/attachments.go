@@ -25,6 +25,39 @@ var (
 	errAttachmentTooLarge        = fmt.Errorf("attachment exceeds the %d MiB limit", maxAttachmentSize>>20)
 )
 
+// attachmentMediaTypes keeps image and document types stable even in minimal
+// container images without /etc/mime.types. Relying only on mime.TypeByExtension
+// made phone photos such as .webp/.heic fall back to application/octet-stream,
+// so they were stored as generic files instead of images.
+var attachmentMediaTypes = map[string]string{
+	".avif": "image/avif",
+	".csv":  "text/csv; charset=utf-8",
+	".gif":  "image/gif",
+	".heic": "image/heic",
+	".heif": "image/heif",
+	".jpeg": "image/jpeg",
+	".jpg":  "image/jpeg",
+	".json": "application/json",
+	".md":   "text/markdown; charset=utf-8",
+	".pdf":  "application/pdf",
+	".png":  "image/png",
+	".svg":  "image/svg+xml",
+	".txt":  "text/plain; charset=utf-8",
+	".webp": "image/webp",
+	".zip":  "application/zip",
+}
+
+func attachmentMediaType(filename string) string {
+	extension := strings.ToLower(filepath.Ext(filename))
+	if mediaType, ok := attachmentMediaTypes[extension]; ok {
+		return mediaType
+	}
+	if mediaType := mime.TypeByExtension(extension); mediaType != "" {
+		return mediaType
+	}
+	return "application/octet-stream"
+}
+
 type Attachment struct {
 	ID        int64  `json:"id"`
 	NoteID    int64  `json:"note_id"`
@@ -124,10 +157,7 @@ func (a *App) SaveAttachment(noteID int64, source io.Reader, originalFilename st
 	if err := os.Rename(tempName, destination); err != nil {
 		return Attachment{}, fmt.Errorf("store attachment: %w", err)
 	}
-	mediaType := mime.TypeByExtension(filepath.Ext(filename))
-	if mediaType == "" {
-		mediaType = "application/octet-stream"
-	}
+	mediaType := attachmentMediaType(filename)
 	tx, err := a.db.Begin()
 	if err != nil {
 		return Attachment{}, removeAttachmentFile(destination, fmt.Errorf("begin attachment metadata transaction: %w", err))

@@ -131,3 +131,55 @@ func TestTableEndpointPaginates(t *testing.T) {
 		t.Fatal("expected truncated flag")
 	}
 }
+
+func TestTableColumnSettingsPersistAcrossBrowsers(t *testing.T) {
+	dataDir := t.TempDir()
+	app, err := NewApp(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := app.Handler(filepath.Join("..", "web", "frontend"))
+
+	initial := performJSONRequest(t, handler, http.MethodGet, "/api/table-columns", nil)
+	if initial.Code != http.StatusOK {
+		t.Fatalf("initial status = %d, body = %s", initial.Code, initial.Body.String())
+	}
+	initialPayload := decodeResponse[TableColumnSettings](t, initial)
+	if initialPayload.Configured || len(initialPayload.Hidden) != 0 {
+		t.Fatalf("unexpected initial settings: %#v", initialPayload)
+	}
+
+	saved := performJSONRequest(t, handler, http.MethodPut, "/api/table-columns",
+		map[string]any{"hidden": []string{" status ", "autor", "status", "  "}})
+	if saved.Code != http.StatusOK {
+		t.Fatalf("save status = %d, body = %s", saved.Code, saved.Body.String())
+	}
+	savedPayload := decodeResponse[TableColumnSettings](t, saved)
+	if !savedPayload.Configured || len(savedPayload.Hidden) != 2 ||
+		savedPayload.Hidden[0] != "status" || savedPayload.Hidden[1] != "autor" {
+		t.Fatalf("unexpected saved settings: %#v", savedPayload)
+	}
+
+	tooLong := strings.Repeat("a", maxTableColumnKeyLength+1)
+	invalid := performJSONRequest(t, handler, http.MethodPut, "/api/table-columns",
+		map[string]any{"hidden": []string{tooLong}})
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid status = %d", invalid.Code)
+	}
+
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewApp(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	settings, err := reopened.TableColumnSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settings.Configured || len(settings.Hidden) != 2 || settings.Hidden[1] != "autor" {
+		t.Fatalf("settings did not survive reopening: %#v", settings)
+	}
+}

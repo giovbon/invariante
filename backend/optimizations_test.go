@@ -359,3 +359,165 @@ func TestTasksTrackContentAndMarkerChanges(t *testing.T) {
 		t.Fatalf("marker change did not update tasks: %#v", tasks)
 	}
 }
+
+// TestAttachmentMediaTypeCoversPhoneImages keeps phone photos recognizable
+// even when the server runs on a minimal image without /etc/mime.types, where
+// mime.TypeByExtension does not know formats such as webp or heic.
+func TestAttachmentMediaTypeCoversPhoneImages(t *testing.T) {
+	cases := map[string]string{
+		"IMG_0001.HEIC":   "image/heic",
+		"foto.webp":       "image/webp",
+		"scan.avif":       "image/avif",
+		"retrato.jpeg":    "image/jpeg",
+		"nota.txt":        "text/plain; charset=utf-8",
+		"backup.zip":      "application/zip",
+		"arquivo.pkmtest": "application/octet-stream",
+	}
+	for name, want := range cases {
+		if got := attachmentMediaType(name); got != want {
+			t.Errorf("attachmentMediaType(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// TestContentOnlyUpdateKeepsLinkIndexFresh guards the autosave hot path. The
+// link index only stores IDs, titles and folders, so a save that touches just
+// the body must not force the next backlinks/preview/graph request to rescan
+// the whole notes table. A title or folder change still has to invalidate it.
+func TestContentOnlyUpdateKeepsLinkIndexFresh(t *testing.T) {
+	app, err := NewApp(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	targetID, err := app.CreateNote(Note{Title: "Alvo", Content: "corpo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID, err := app.CreateNote(Note{Title: "Origem", Content: "ver [[Alvo]]"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	index, err := app.noteIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index.revision != app.currentDataRevision() {
+		t.Fatalf("warm index revision = %d, want %d", index.revision, app.currentDataRevision())
+	}
+
+	note, err := app.GetNote(targetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	note.Content += "\nparágrafo novo"
+	if err := app.UpdateNote(targetID, note); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh, err := app.noteIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh != index {
+		t.Fatal("content-only update rebuilt the link index")
+	}
+	if fresh.revision != app.currentDataRevision() {
+		t.Fatalf("index revision = %d, want %d", fresh.revision, app.currentDataRevision())
+	}
+
+	backlinks, err := app.Backlinks(targetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backlinks) != 1 || backlinks[0].ID != sourceID {
+		t.Fatalf("backlinks after content save = %#v", backlinks)
+	}
+
+	note, err = app.GetNote(targetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	note.Title = "Alvo renomeado"
+	if err := app.UpdateNote(targetID, note); err != nil {
+		t.Fatal(err)
+	}
+	afterRename, err := app.noteIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRename == index {
+		t.Fatal("title change reused the stale link index")
+	}
+	if afterRename.revision != app.currentDataRevision() {
+		t.Fatalf("renamed index revision = %d, want %d", afterRename.revision, app.currentDataRevision())
+	}
+}
+
+// TestBacklinkIndexTracksLinkChanges keeps the revision-keyed backlink index
+// honest: it may only be reused while note_links and the title/folder index
+// are unchanged, even when the save itself touched just the note body.
+func TestBacklinkIndexTracksLinkChanges(t *testing.T) {
+	app, err := NewApp(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	targetID, err := app.CreateNote(Note{Title: "Alvo", Content: "corpo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID, err := app.CreateNote(Note{Title: "Origem", Content: "[[Alvo]]"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantBacklinks := func(step string, want int) {
+		t.Helper()
+		links, err := app.Backlinks(targetID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(links) != want {
+			t.Fatalf("%s: backlinks = %#v, want %d", step, links, want)
+		}
+		if want > 0 && links[0].ID != sourceID {
+			t.Fatalf("%s: backlink source = %d, want %d", step, links[0].ID, sourceID)
+		}
+	}
+
+	wantBacklinks("initial", 1)
+
+	source, err := app.GetNote(sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.Content = "sem links"
+	if err := app.UpdateNote(sourceID, source); err != nil {
+		t.Fatal(err)
+	}
+	wantBacklinks("link removed", 0)
+
+	source, err = app.GetNote(sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.Content = "[[Alvo]] de novo"
+	if err := app.UpdateNote(sourceID, source); err != nil {
+		t.Fatal(err)
+	}
+	wantBacklinks("link restored", 1)
+
+	target, err := app.GetNote(targetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Title = "Alvo renomeado"
+	if err := app.UpdateNote(targetID, target); err != nil {
+		t.Fatal(err)
+	}
+	wantBacklinks("target renamed", 1)
+}
