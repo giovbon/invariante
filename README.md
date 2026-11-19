@@ -46,6 +46,8 @@ AUTHENTICATION_PASSWORD='uma-senha-forte' AUTHENTICATION_COOKIE_SECURE=true ./ru
 
 `AUTHENTICATION_COOKIE_SECURE=true` deve ser usado somente quando o navegador acessa o app por HTTPS; caso contrário, o navegador não enviará o cookie.
 
+Atrás de um proxy reverso, libere o tamanho dos uploads de anexos (o limite do app é 25 MiB por arquivo). No nginx, o padrão é 1 MB e precisa ser aumentado, por exemplo com `client_max_body_size 26m;` no `server` ou no `location` da aplicação. Sem isso, o proxy responde `413` antes de a requisição chegar ao backend.
+
 ### Captura via ntfy
 
 O backend pode assinar um tópico do [ntfy](https://ntfy.sh) e transformar cada mensagem em uma nota na pasta virtual **Inbox**. O recurso fica desligado por padrão:

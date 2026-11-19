@@ -225,8 +225,11 @@
             <div class="attachments-dialog-actions">
                 <button class="button" id="addPhoto" type="button">Enviar foto</button>
                 <button class="button" data-variant="primary" id="addAttachment" type="button">Enviar arquivos</button>
-                <input id="attachmentPhotoInput" type="file" accept="image/*" multiple hidden>
-                <input id="attachmentInput" type="file" multiple hidden>
+                <!-- Mantidos no layout (apenas visualmente ocultos): alguns
+                     navegadores Android não entregam o arquivo escolhido em
+                     inputs com display:none. -->
+                <input id="attachmentPhotoInput" class="sr-only" type="file" accept="image/*" multiple>
+                <input id="attachmentInput" class="sr-only" type="file" multiple>
             </div>
         </dialog>
         <dialog id="helpDialog" class="help-dialog" aria-labelledby="helpTitle">

@@ -50,6 +50,84 @@ test('attaches a file to a brand-new note before it is saved', async ({ page }) 
     await expect(page.locator('#saveStatus')).toHaveText(/Salvo automaticamente/);
 });
 
+test('processes the selection when Android does not fire change', async ({ page, request }) => {
+    const note = await createNote(request, {
+        title: uniqueTitle('Anexo Android'),
+        content: '',
+        folder: ''
+    });
+
+    await page.goto(`/?note=${note.id}`);
+    await page.locator('#attachmentsButton').click();
+
+    // O seletor abre, mas o Android devolve o controle sem disparar change.
+    const [chooser] = await Promise.all([
+        page.waitForEvent('filechooser'),
+        page.locator('#addAttachment').click()
+    ]);
+    await chooser.setFiles([]);
+    await page.waitForTimeout(200);
+
+    // O arquivo só aparece em input.files quando a janela recupera o foco.
+    await page.evaluate(() => {
+        const input = document.querySelector('#attachmentInput');
+        const transfer = new DataTransfer();
+        transfer.items.add(new File(['conteúdo android'], 'android.txt', { type: 'text/plain' }));
+        input.files = transfer.files;
+        window.dispatchEvent(new Event('focus'));
+    });
+
+    await expect(page.locator('#attachmentList')).toContainText('android.txt');
+    await expect(page.locator('#noteContent')).toHaveValue(/android\.txt/);
+    await expect(page.locator('#saveStatus')).toHaveText(/Salvo automaticamente/);
+});
+
+test('explains a 413 returned by a reverse proxy', async ({ page, request }) => {
+    const note = await createNote(request, {
+        title: uniqueTitle('Anexo proxy'),
+        content: '',
+        folder: ''
+    });
+
+    await page.route('**/api/notes/*/attachments', route => route.fulfill({
+        status: 413,
+        contentType: 'text/html',
+        body: '<html><body>413 Request Entity Too Large</body></html>'
+    }));
+
+    await page.goto(`/?note=${note.id}`);
+    await page.locator('#attachmentsButton').click();
+    await page.locator('#attachmentInput').setInputFiles({
+        name: 'grande.bin',
+        mimeType: 'application/octet-stream',
+        buffer: Buffer.alloc(1024)
+    });
+
+    await expect(page.locator('#appMessage')).toContainText('proxy reverso');
+    await expect(page.locator('#appMessage')).toContainText('client_max_body_size');
+});
+
+test('does not upload the same selection twice when change and focus both fire', async ({ page, request }) => {
+    const note = await createNote(request, {
+        title: uniqueTitle('Anexo Android'),
+        content: '',
+        folder: ''
+    });
+
+    await page.goto(`/?note=${note.id}`);
+    await page.locator('#attachmentsButton').click();
+    await page.locator('#attachmentInput').setInputFiles({
+        name: 'unico.txt',
+        mimeType: 'text/plain',
+        buffer: Buffer.from('conteúdo')
+    });
+    await expect(page.locator('#attachmentList')).toContainText('unico.txt');
+
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await page.waitForTimeout(500);
+    await expect(page.locator('#attachmentList li')).toHaveCount(1);
+});
+
 test('table view reflects an attachment deletion immediately after returning from the editor', async ({ page, request }) => {
     const note = await createNote(request, {
         title: uniqueTitle('Anexo na tabela'),

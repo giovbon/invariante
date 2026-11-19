@@ -105,6 +105,7 @@ Cada bloco aceita até 50 itens e a nota aceita até 20 blocos. `backlinks` e `l
 - Anexar em uma nota nova cria a nota automaticamente antes do envio.
 - Imagens compatíveis entram como `![nome](URL)`; outros arquivos entram como links Markdown.
 - Os arquivos ficam em `attachments/<id-da-nota>/` no diretório de dados.
+- Se o app estiver atrás de um proxy reverso e o envio falhar com `413`, aumente o limite de corpo do proxy (no nginx: `client_max_body_size 26m;`).
 
 ## Backup
 

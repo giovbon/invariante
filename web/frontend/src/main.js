@@ -600,15 +600,22 @@ function setupEventListeners() {
         elements.attachmentsDialog.close();
         elements.attachmentsButton.focus();
     });
-    elements.addAttachment.addEventListener('click', () => elements.attachmentInput.click());
-    elements.addAttachmentPhoto.addEventListener('click', () => elements.attachmentPhotoInput.click());
-    for (const input of [elements.attachmentInput, elements.attachmentPhotoInput]) {
-        input.addEventListener('change', event => {
-            const files = [...event.target.files];
-            event.target.value = '';
-            if (files.length) void uploadAttachments(files);
-        });
+    const attachmentInputs = [elements.attachmentInput, elements.attachmentPhotoInput];
+    for (const input of attachmentInputs) {
+        // Alguns navegadores disparam apenas "input"; o WeakSet em
+        // handleAttachmentSelection impede upload duplicado.
+        input.addEventListener('input', () => handleAttachmentSelection(input));
+        input.addEventListener('change', () => handleAttachmentSelection(input));
     }
+    elements.addAttachment.addEventListener('click', () => startAttachmentPicker(elements.attachmentInput));
+    elements.addAttachmentPhoto.addEventListener('click', () => startAttachmentPicker(elements.attachmentPhotoInput));
+    // Alguns Android/Chrome não disparam "change" ao voltar do seletor de
+    // arquivos (ou só preenchem input.files depois do foco). Ao recuperar o
+    // foco, conferimos o input pendente e processamos o arquivo manualmente.
+    window.addEventListener('focus', () => processPendingAttachmentSelection());
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') processPendingAttachmentSelection();
+    });
     elements.attachmentList.addEventListener('click', event => {
         const button = event.target.closest('[data-delete-attachment]');
         if (button) void deleteAttachment(Number(button.dataset.deleteAttachment));
@@ -1807,6 +1814,62 @@ function renderAttachments(attachments, noteID) {
 }
 
 const maxAttachmentBytes = 25 * 1024 * 1024;
+const uploadingAttachmentInputs = new WeakSet();
+let pendingAttachmentInput = null;
+let attachmentPickerTimer = 0;
+
+function startAttachmentPicker(input) {
+    if (!input) return;
+    pendingAttachmentInput = input;
+    window.clearTimeout(attachmentPickerTimer);
+    // Se o usuário cancelar o seletor, não deixe um input pendente para sempre.
+    attachmentPickerTimer = window.setTimeout(() => {
+        if (pendingAttachmentInput === input) pendingAttachmentInput = null;
+    }, 120000);
+    input.click();
+}
+
+function clearPendingAttachmentInput(input) {
+    if (pendingAttachmentInput !== input) return;
+    pendingAttachmentInput = null;
+    window.clearTimeout(attachmentPickerTimer);
+}
+
+function handleAttachmentSelection(input) {
+    if (!input || uploadingAttachmentInputs.has(input)) return false;
+    const files = input.files ? Array.from(input.files) : [];
+    if (!files.length) return false;
+    clearPendingAttachmentInput(input);
+    uploadingAttachmentInputs.add(input);
+    void uploadAttachments(files)
+        .catch(error => {
+            showMessage(`Não foi possível enviar o anexo: ${error.message}`, 'error');
+        })
+        .finally(() => {
+            uploadingAttachmentInputs.delete(input);
+            // Só limpa depois que o upload terminou: em alguns Android o
+            // reset imediato invalida os File entregues pelo seletor.
+            input.value = '';
+        });
+    return true;
+}
+
+function processPendingAttachmentSelection(attempt = 0) {
+    const input = pendingAttachmentInput;
+    if (!input) return;
+    // O Chrome no Android pode preencher input.files alguns instantes depois
+    // de a janela recuperar o foco. Tentamos algumas vezes antes de desistir.
+    const delays = [150, 400, 900, 1600];
+    window.setTimeout(() => {
+        if (pendingAttachmentInput !== input) return;
+        if (handleAttachmentSelection(input)) return;
+        if (attempt + 1 >= delays.length) {
+            clearPendingAttachmentInput(input);
+            return;
+        }
+        processPendingAttachmentSelection(attempt + 1);
+    }, delays[attempt] ?? delays[delays.length - 1]);
+}
 
 function attachmentFilename(file) {
     const name = (file.name || '').trim();
@@ -1816,6 +1879,15 @@ function attachmentFilename(file) {
     const subtype = (file.type || '').split('/')[1] || '';
     const extension = subtype.replace(/[^a-z0-9]/gi, '') || 'bin';
     return `anexo-${Date.now()}.${extension}`;
+}
+
+async function attachmentResponseError(response) {
+    const text = (await response.text()).trim();
+    // Proxies costumam devolver uma página HTML inteira em erros (413, 502).
+    // O aviso na tela deve mostrar apenas um resumo legível.
+    const plain = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    const detail = plain || `HTTP ${response.status}`;
+    return detail.length > 200 ? `${detail.slice(0, 200)}…` : detail;
 }
 
 function setAttachmentUploading(uploading) {
@@ -1829,18 +1901,19 @@ function setAttachmentUploading(uploading) {
 
 async function uploadAttachments(files) {
     if (!files.length || state.view !== 'editor') return;
-    // A brand-new note only exists in the browser until it is saved. Force the
-    // first save so the attachment has a note to belong to; otherwise the
-    // upload was silently dropped.
-    if (!(await saveSession.flush({ create: true })) || state.noteID === null) {
-        if (state.noteID === null) {
-            showMessage('Não foi possível criar a nota antes de enviar o anexo. Informe um título e tente novamente.', 'error');
-        }
-        return;
-    }
-    const noteID = state.noteID;
     setAttachmentUploading(true);
     try {
+        // A brand-new note only exists in the browser until it is saved. Force
+        // the first save so the attachment has a note to belong to; otherwise
+        // the upload was silently dropped.
+        const saved = await saveSession.flush({ create: true });
+        if (!saved || state.noteID === null) {
+            showMessage(state.noteID === null
+                ? 'Não foi possível criar a nota antes de enviar o anexo. Informe um título e tente novamente.'
+                : 'Não foi possível salvar a nota antes de enviar o anexo. Tente novamente.', 'error');
+            return;
+        }
+        const noteID = state.noteID;
         for (const file of files) {
             if (file.size > maxAttachmentBytes) {
                 showMessage(`${attachmentFilename(file)} tem ${formatFileSize(file.size)}; o limite por anexo é ${formatFileSize(maxAttachmentBytes)}.`, 'error');
@@ -1856,9 +1929,9 @@ async function uploadAttachments(files) {
                 }
                 if (!response.ok) {
                     if (response.status === 413) {
-                        throw new Error(`arquivo maior que o limite de ${formatFileSize(maxAttachmentBytes)}`);
+                        throw new Error('o servidor recusou o arquivo por tamanho (413); se houver um proxy reverso, aumente o limite de corpo (por exemplo, client_max_body_size 26m)');
                     }
-                    throw new Error((await response.text()).trim() || `HTTP ${response.status}`);
+                    throw new Error(await attachmentResponseError(response));
                 }
                 const attachment = await response.json();
                 if (state.noteID === noteID) {
@@ -1867,7 +1940,10 @@ async function uploadAttachments(files) {
                     await loadAttachments(noteID);
                 }
             } catch (error) {
-                showMessage(`Não foi possível enviar ${attachmentFilename(file)}: ${error.message}`, 'error');
+                const message = error instanceof TypeError
+                    ? 'falha de rede; verifique a conexão ou o proxy reverso'
+                    : error.message;
+                showMessage(`Não foi possível enviar ${attachmentFilename(file)}: ${message}`, 'error');
                 return;
             }
         }
