@@ -309,6 +309,24 @@
         box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
     }
 
+    .graph-actions .graph-scope {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--muted);
+        font-size: var(--text-sm);
+        white-space: nowrap;
+        cursor: pointer;
+    }
+
+    .graph-actions .graph-scope input {
+        width: auto;
+        height: auto;
+        margin: 0;
+        padding: 0;
+        accent-color: var(--accent);
+    }
+
     .graph-legend {
         display: flex;
         min-height: 38px;

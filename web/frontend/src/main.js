@@ -34,6 +34,8 @@ const state = {
     graphVisible: false,
     graphData: null,
     graphRequestID: 0,
+    graphScopeCurrent: false,
+    graphCacheKey: '',
     backlinks: null,
     backlinksError: '',
     backlinksRequestID: 0,
@@ -55,6 +57,7 @@ const state = {
     listState: null,
     directEntry: false,
     requestID: 0,
+    notesAbortController: null,
     navigationID: 0,
     searchTimer: null,
     saveTimer: null,
@@ -87,6 +90,7 @@ let workspacePanelWidth = 280;
 const elements = {
     searchView: document.querySelector('#searchView'),
     graphView: document.querySelector('#graphView'),
+    graphScopeCurrent: document.querySelector('#graphScopeCurrent'),
     editorView: document.querySelector('#editorView'),
     searchInput: document.querySelector('#searchInput'),
     resultsSection: document.querySelector('#resultsSection'),
@@ -231,6 +235,7 @@ const folderTree = createFolderTree({
     showMessage,
     loadFolders,
     loadFolderNotes,
+    loadTree: loadTreeNotes,
     loadNotes,
     openNote,
     openNewNote,
@@ -496,9 +501,10 @@ async function initialize() {
         loadNotes();
     }
 
-    loadFolders();
+    void loadTreeNotes().catch(error => {
+        showMessage(`Não foi possível carregar as pastas: ${error.message}`, 'error');
+    });
     loadTags();
-    void loadFolderNotes('', false);
     void tasksPanel.loadMarkers();
     // Counting tasks scans every note. It only feeds the sidebar badge, so let
     // the first screen settle and skip the scan if the panel was opened first.
@@ -545,6 +551,12 @@ function setupEventListeners() {
     document.querySelector('#closeGraph').addEventListener('click', closeGraphView);
     document.querySelector('#fitGraph').addEventListener('click', () => graphView.fit());
     document.querySelector('#graphSearch').addEventListener('input', event => graphView.setSearch(event.target.value));
+    elements.graphScopeCurrent.addEventListener('change', () => {
+        state.graphScopeCurrent = elements.graphScopeCurrent.checked;
+        state.graphData = null;
+        state.graphCacheKey = '';
+        if (state.graphVisible) void openGraphView();
+    });
     elements.newNote.addEventListener('click', () => openNewNote());
     document.querySelector('#commandButton').addEventListener('click', () => void commandPalette.open());
     elements.helpButton.addEventListener('click', () => void openHelp());
@@ -650,10 +662,11 @@ function setupEventListeners() {
     elements.tableColumnsList.addEventListener('change', event => {
         const input = event.target.closest('[data-table-column]');
         if (!input) return;
-        if (input.checked) state.tableHiddenProperties.delete(input.dataset.tableColumn);
-        else state.tableHiddenProperties.add(input.dataset.tableColumn);
+        const key = input.dataset.tableColumn;
+        if (input.checked) state.tableHiddenProperties.delete(key);
+        else state.tableHiddenProperties.add(key);
         tableView.saveColumnPreferences();
-        tableView.render();
+        tableView.setColumnVisible(key, input.checked);
     });
     elements.tableColumnsAll.addEventListener('click', () => {
         state.tableHiddenProperties.clear();
@@ -892,7 +905,11 @@ async function openGraphView() {
     graphButton.setAttribute('aria-pressed', 'true');
     updateListHistory();
     requestAnimationFrame(() => graphView.resize());
-    if (state.graphData) {
+    elements.graphScopeCurrent.disabled = !state.folder && !state.tag;
+    const scopeFolder = state.graphScopeCurrent ? state.folder : '';
+    const scopeTag = state.graphScopeCurrent ? state.tag : '';
+    const graphCacheKey = `${scopeFolder}\u0000${scopeTag}`;
+    if (state.graphData && state.graphCacheKey === graphCacheKey) {
         graphView.setGraph(state.graphData);
         updateGraphSummary(state.graphData);
         return;
@@ -901,13 +918,18 @@ async function openGraphView() {
     const requestID = ++state.graphRequestID;
     const summary = document.querySelector('#graphSummary');
     summary.innerHTML = '<span class="skeleton skeleton-line" aria-hidden="true"></span>';
+    const params = new URLSearchParams();
+    if (scopeFolder) params.set('folder', scopeFolder);
+    if (scopeTag) params.set('tag', scopeTag);
+    const endpoint = params.size ? `/api/graph?${params}` : '/api/graph';
     try {
-        const graph = await requestJSON('/api/graph');
+        const graph = await requestJSON(endpoint);
         if (requestID !== state.graphRequestID || !state.graphVisible) return;
         if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) {
             throw new Error('Resposta inválida da API do grafo.');
         }
         state.graphData = graph;
+        state.graphCacheKey = graphCacheKey;
         graphView.setGraph(graph);
         updateGraphSummary(graph);
         requestAnimationFrame(() => graphView.fit());
@@ -961,6 +983,12 @@ async function loadNotes() {
         await tableView.load();
         return;
     }
+    // Typing in the search box can start requests faster than the FTS index
+    // answers them. Cancel the previous request so the server stops working on
+    // a query whose results the UI will discard anyway.
+    state.notesAbortController?.abort();
+    const controller = new AbortController();
+    state.notesAbortController = controller;
     const requestID = ++state.requestID;
     const query = elements.searchInput.value.trim();
     const params = new URLSearchParams({
@@ -976,7 +1004,7 @@ async function loadNotes() {
     }
     if (!state.notesLoaded) noteList.renderSkeletons();
     try {
-        const page = await requestJSON(`${endpoint}?${params}`);
+        const page = await requestJSON(`${endpoint}?${params}`, { signal: controller.signal });
         if (requestID !== state.requestID) return;
         state.notesLoaded = true;
         if (page.total > 0 && state.offset >= page.total) {
@@ -987,6 +1015,7 @@ async function loadNotes() {
         state.total = page.total;
         noteList.render(page);
     } catch (error) {
+        if (error.name === 'AbortError') return;
         if (requestID === state.requestID) {
             if (!state.notesLoaded) {
                 state.notesLoaded = true;
@@ -1114,6 +1143,24 @@ function handlePanelClick(event) {
     }
 }
 
+
+async function loadTreeNotes() {
+    const generation = state.folderNotesGeneration;
+    const folders = ['', ...state.expandedFolders]
+        .filter((folder, index, list) => list.indexOf(folder) === index);
+    const params = new URLSearchParams({ limit: String(treePageSize) });
+    for (const folder of folders) params.append('folder', folder);
+    const { data, response } = await requestJSONResponse(`/api/tree-notes?${params}`);
+    if (generation !== state.folderNotesGeneration) return;
+    if (!Array.isArray(data?.folders) || !data.notes) throw new Error('resposta de pastas inválida');
+    const revision = Number(response.headers.get('X-Notes-Revision'));
+    folderTree.noteRevision(revision);
+    state.folders = data.folders;
+    for (const [folder, page] of Object.entries(data.notes)) {
+        state.folderNotes.set(folder, { items: page.items || [], total: page.total || 0 });
+    }
+    if (elements.panel.dataset.panel === 'files') folderTree.render();
+}
 
 async function loadFolders() {
     try {

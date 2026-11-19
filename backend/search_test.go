@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -88,5 +89,30 @@ func TestNoteOccurrencesFollowsTheSameFallback(t *testing.T) {
 	}
 	if len(snippets) == 0 || occurrences == 0 {
 		t.Fatalf("occurrences did not use the relaxed match: snippets=%#v occurrences=%d", snippets, occurrences)
+	}
+}
+
+func TestSearchTotalCapsAtLimit(t *testing.T) {
+	app := newTestApp(t)
+	tx, err := app.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < maxSearchCount+5; index++ {
+		if _, err := tx.Exec("INSERT INTO notes(title, content) VALUES (?, ?)",
+			"Cap "+strconv.Itoa(index), "cappedtoken body"); err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	page, err := app.SearchNotes("cappedtoken", "content", "", "", 5, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != maxSearchCount || !page.TotalCapped || len(page.Items) != 5 {
+		t.Fatalf("capped search = total %d capped %v items %d", page.Total, page.TotalCapped, len(page.Items))
 	}
 }

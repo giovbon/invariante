@@ -27,8 +27,34 @@ test('opens the graph and renders linked notes', async ({ page, request }) => {
     await expect(page.locator('#searchView')).toBeVisible();
 });
 
-test('loads the module worker used for large graph layouts', async ({ page }) => {
+test('limits the graph to the current folder', async ({ page, request }) => {
+    const suffix = uniqueTitle('Escopo');
+    const folder = uniqueTitle('PastaGrafo');
+    const source = await createNote(request, {
+        title: `${suffix} A`,
+        folder,
+        content: `Link para [[${suffix} B]]`
+    });
+    const target = await createNote(request, {
+        title: `${suffix} B`,
+        folder,
+        content: 'Destino do link'
+    });
+    const outside = await createNote(request, {
+        title: `${suffix} Fora`,
+        content: `Link para [[${suffix} A]]`
+    });
+
     await page.goto('/');
+    await page.locator(`[data-folder="${folder}"]`).click();
+    await page.locator('#graphButton').click();
+    await page.locator('#graphScopeCurrent').check();
+    await expect(page.locator(`#noteGraph [data-node-id="${source.id}"]`)).toBeVisible();
+    await expect(page.locator(`#noteGraph [data-node-id="${target.id}"]`)).toBeVisible();
+    await expect(page.locator(`#noteGraph [data-node-id="${outside.id}"]`)).toHaveCount(0);
+});
+
+test('loads the module worker used for large graph layouts', async ({ page }) => {    await page.goto('/');
     const layout = await page.evaluate(async () => {
         const worker = new Worker('/src/lib/graph-layout-worker.js', { type: 'module' });
         try {

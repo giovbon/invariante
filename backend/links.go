@@ -267,6 +267,60 @@ func (a *App) NoteGraph() (NoteGraph, error) {
 	return graph, nil
 }
 
+// NoteGraphFiltered restricts the cached graph to notes inside a folder
+// (including its descendants) and/or carrying a tag. Large libraries can be
+// explored folder by folder instead of always transferring every node and
+// edge. With no filters it returns the complete graph unchanged.
+func (a *App) NoteGraphFiltered(folder, tag string) (NoteGraph, error) {
+	graph, err := a.NoteGraph()
+	if err != nil {
+		return NoteGraph{}, err
+	}
+	if folder == "" && tag == "" {
+		return graph, nil
+	}
+	rows, err := a.readDB.Query(`SELECT rowid FROM notes
+		WHERE (? = '' OR folder = ? OR substr(folder, 1, length(?) + 1) = ? || '/')
+		AND (? = '' OR EXISTS (
+			SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?
+		))`,
+		folder, folder, folder, folder, tag, tag)
+	if err != nil {
+		return NoteGraph{}, err
+	}
+	defer rows.Close()
+	allowed := make(map[int64]struct{})
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return NoteGraph{}, err
+		}
+		allowed[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return NoteGraph{}, err
+	}
+	filtered := NoteGraph{
+		Nodes: make([]GraphNode, 0, len(allowed)),
+		Edges: make([]GraphEdge, 0),
+	}
+	for _, node := range graph.Nodes {
+		if _, ok := allowed[node.ID]; ok {
+			filtered.Nodes = append(filtered.Nodes, node)
+		}
+	}
+	for _, edge := range graph.Edges {
+		if _, ok := allowed[edge.Source]; !ok {
+			continue
+		}
+		if _, ok := allowed[edge.Target]; !ok {
+			continue
+		}
+		filtered.Edges = append(filtered.Edges, edge)
+	}
+	return filtered, nil
+}
+
 func (a *App) buildNoteGraph() (NoteGraph, error) {
 	index, err := a.noteIndex()
 	if err != nil {
@@ -533,7 +587,7 @@ func replaceNoteLinks(tx *sql.Tx, sourceID int64, content string) error {
 			return err
 		}
 	}
-	return nil
+	return replaceNoteTasks(tx, sourceID, content)
 }
 
 // rewriteIncomingLinks updates the source notes that referenced the renamed
@@ -1276,7 +1330,13 @@ func (a *App) handleGraph(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	graph, err := a.NoteGraph()
+	folder := r.URL.Query().Get("folder")
+	normalized, err := normalizeFolder(folder)
+	if err != nil || normalized != folder {
+		http.Error(w, "folder must be a normalized relative path", http.StatusBadRequest)
+		return
+	}
+	graph, err := a.NoteGraphFiltered(folder, strings.TrimSpace(r.URL.Query().Get("tag")))
 	if err != nil {
 		log.Printf("build note graph: %v", err)
 		http.Error(w, "failed to build note graph", http.StatusInternalServerError)

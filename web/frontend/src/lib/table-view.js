@@ -270,6 +270,22 @@ function renderTableColumnsMenu(propertyKeys) {
     }
 }
 
+// Toggles a single property column without rebuilding the table, so scroll
+// position, selection and sort state survive. The menu is only refreshed for
+// its visible-count label.
+function setColumnVisible(key, visible) {
+    if (!state.table) return;
+    const field = tablePropertyField(key);
+    try {
+        if (visible) state.table.showColumn(field);
+        else state.table.hideColumn(field);
+    } catch {
+        // A column added after the table was built can only be shown after a
+        // rebuild; individual toggles always target keys present in the data.
+    }
+    renderTableColumnsMenu(tablePropertyKeys(state.tableData));
+}
+
 function tableAttachmentRow(note, attachment) {
     const values = [attachment.filename, attachment.media_type, formatFileSize(attachment.size)];
     return {
@@ -303,7 +319,6 @@ function renderTable() {
     }
 
     const propertyKeys = tablePropertyKeys(state.tableData);
-    const visiblePropertyKeys = propertyKeys.filter(key => !state.tableHiddenProperties.has(key));
     renderTableColumnsMenu(propertyKeys);
     const rows = state.tableData.map(note => {
         const attachments = (note.attachments || []).map(attachment => tableAttachmentRow(note, attachment));
@@ -350,11 +365,12 @@ function renderTable() {
             editor: tableCellEditor,
             sorter: tablePropertySorter
         },
-        ...visiblePropertyKeys.map(key => ({
+        ...propertyKeys.map(key => ({
             title: key,
             field: tablePropertyField(key),
             minWidth: 110,
             widthGrow: 1,
+            visible: !state.tableHiddenProperties.has(key),
             formatter: tablePropertyFormatter,
             editor: tableCellEditor,
             sorter: tablePropertySorter
@@ -833,6 +849,7 @@ function downloadTableAttachment(data) {
         },
         loadColumnPreferences: loadTableColumnPreferences,
         saveColumnPreferences: saveTableColumnPreferences,
+        setColumnVisible,
         updateFooter: updateTableFooter,
         removeAttachment: removeAttachmentFromTable
     };

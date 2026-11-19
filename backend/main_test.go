@@ -557,6 +557,99 @@ func TestFolderNotesEndpointListsExactFolderAndRoot(t *testing.T) {
 	}
 }
 
+func TestTreeNotesEndpointBundlesExpandedFolders(t *testing.T) {
+	app, err := NewApp(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	handler := app.Handler(filepath.Join("..", "web", "frontend"))
+	for _, note := range []Note{
+		{Title: "Root note", Content: "root"},
+		{Title: "Project note", Content: "project", Folder: "Projects"},
+		{Title: "Nested note", Content: "nested", Folder: "Projects/Ideas"},
+	} {
+		if _, err := app.CreateNote(note); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/tree-notes?folder=&folder=Projects&limit=10", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("X-Notes-Revision") == "" {
+		t.Fatal("tree response is missing the revision header")
+	}
+	var payload treeNotesResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Folders) != 1 || payload.Folders[0].Path != "Projects" {
+		t.Fatalf("folders = %#v", payload.Folders)
+	}
+	if page := payload.Notes[""]; page.Total != 1 || len(page.Items) != 1 || page.Items[0].Title != "Root note" {
+		t.Fatalf("root notes = %#v", page)
+	}
+	if page := payload.Notes["Projects"]; page.Total != 1 || len(page.Items) != 1 || page.Items[0].Title != "Project note" {
+		t.Fatalf("project notes = %#v", page)
+	}
+	if _, exists := payload.Notes["Projects/Ideas"]; exists {
+		t.Fatal("expanded payload included a folder that was not requested")
+	}
+}
+
+func TestGraphEndpointFiltersByFolderAndTag(t *testing.T) {
+	app, err := NewApp(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	handler := app.Handler(filepath.Join("..", "web", "frontend"))
+	notes := []Note{
+		{Title: "Alpha project", Folder: "Projects", Tags: []string{"alpha"}, Content: "[[Beta project]]"},
+		{Title: "Beta project", Folder: "Projects", Tags: []string{"beta"}},
+		{Title: "Alpha other", Folder: "Other", Tags: []string{"alpha"}, Content: "[[Beta other]]"},
+		{Title: "Beta other", Folder: "Other", Tags: []string{"beta"}},
+	}
+	for _, note := range notes {
+		if _, err := app.CreateNote(note); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	response := performJSONRequest(t, handler, http.MethodGet, "/api/graph?folder=Projects", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("folder graph status = %d, body = %s", response.Code, response.Body.String())
+	}
+	graph := decodeResponse[NoteGraph](t, response)
+	if len(graph.Nodes) != 2 || len(graph.Edges) != 1 {
+		t.Fatalf("folder graph = %d nodes, %d edges: %#v", len(graph.Nodes), len(graph.Edges), graph)
+	}
+	for _, node := range graph.Nodes {
+		if node.Folder != "Projects" {
+			t.Fatalf("folder filter leaked node %#v", node)
+		}
+	}
+
+	response = performJSONRequest(t, handler, http.MethodGet, "/api/graph?tag=alpha", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("tag graph status = %d, body = %s", response.Code, response.Body.String())
+	}
+	graph = decodeResponse[NoteGraph](t, response)
+	if len(graph.Nodes) != 2 || len(graph.Edges) != 0 {
+		t.Fatalf("tag graph = %d nodes, %d edges: %#v", len(graph.Nodes), len(graph.Edges), graph)
+	}
+	for _, node := range graph.Nodes {
+		if !strings.HasPrefix(node.Title, "Alpha") {
+			t.Fatalf("tag filter leaked node %#v", node)
+		}
+	}
+}
+
 func TestFolderNotesHideFrontmatterNotesAndPaginateVisibleResults(t *testing.T) {
 	app, err := NewApp(t.TempDir())
 	if err != nil {

@@ -19,6 +19,10 @@ export function createNoteListView({
     showMessage,
     renderTagFilter
 }) {
+function formatResultTotal(page) {
+    return page.total_capped ? `${page.total}+` : String(page.total);
+}
+
 function renderNotes(page) {
     elements.notesList.replaceChildren();
     const query = elements.searchInput.value.trim();
@@ -32,7 +36,8 @@ function renderNotes(page) {
     } else {
         elements.resultsTitle.textContent = state.folder ? state.folder.split('/').at(-1) : 'Todas as notas';
     }
-    elements.resultCount.textContent = `${page.total} ${page.total === 1 ? 'nota' : 'notas'}`;
+    const totalLabel = formatResultTotal(page);
+    elements.resultCount.textContent = `${totalLabel} ${page.total === 1 && !page.total_capped ? 'nota' : 'notas'}`;
     if (state.view === 'list') {
         document.querySelector('#currentFolder').textContent = state.folder || 'Todas as notas';
     }
@@ -52,7 +57,7 @@ function renderNotes(page) {
     const first = page.total === 0 ? 0 : page.offset + 1;
     const last = Math.min(page.offset + page.items.length, page.total);
     elements.pagination.hidden = page.total <= page.limit;
-    elements.pageStatus.textContent = `${first}–${last} de ${page.total}`;
+    elements.pageStatus.textContent = `${first}–${last} de ${totalLabel}`;
     elements.previousPage.disabled = page.offset === 0;
     elements.nextPage.disabled = page.offset + page.limit >= page.total;
 }

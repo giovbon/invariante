@@ -64,7 +64,7 @@ test.describe('Tabulator table mode', () => {
         await expect(statusToggle).toBeChecked();
         await statusToggle.uncheck();
 
-        await expect(statusColumn).toHaveCount(0);
+        await expect(statusColumn).toBeHidden();
         await expect(page.locator('.tabulator-col-title', { hasText: /^autor$/ })).toBeVisible();
         await expect.poll(async () => {
             const response = await request.get('/api/table-columns');
@@ -77,7 +77,7 @@ test.describe('Tabulator table mode', () => {
         await page.locator(`[data-folder="${folder}"]`).click();
         await page.locator('.mode-button[data-mode="table"]').click();
         await page.waitForSelector('.tabulator-row.is-note-row', { timeout: 10000 });
-        await expect(page.locator('.tabulator-col-title', { hasText: /^status$/ })).toHaveCount(0);
+        await expect(page.locator('.tabulator-col-title', { hasText: /^status$/ })).toBeHidden();
         await expect(page.locator('.tabulator-col-title', { hasText: /^autor$/ })).toBeVisible();
 
         await page.locator('.table-columns-toggle').click();

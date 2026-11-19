@@ -105,19 +105,33 @@ func (a *App) TaskMarkers() ([]string, error) {
 }
 
 // SaveTaskMarkers validates and stores the marker list in SQLite so the same
-// configuration is shared by every browser connected to the server.
+// configuration is shared by every browser connected to the server. The task
+// index is rebuilt in the same transaction because its rows are derived from
+// the active marker list.
 func (a *App) SaveTaskMarkers(markers []string) ([]string, error) {
 	normalized, err := ParseTaskMarkers(strings.Join(markers, ","))
 	if err != nil {
 		return nil, err
 	}
-	_, err = a.db.Exec(`INSERT INTO app_settings(key, value, updated_at)
-		VALUES (?, ?, datetime('now'))
-		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
-		taskMarkersKey, strings.Join(normalized, ","))
+	tx, err := a.db.Begin()
 	if err != nil {
 		return nil, err
 	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO app_settings(key, value, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+		taskMarkersKey, strings.Join(normalized, ",")); err != nil {
+		return nil, err
+	}
+	if err := rebuildNoteTasks(tx, normalized); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	// The in-memory task pages were built with the previous marker list.
+	a.markDataChanged()
 	return normalized, nil
 }
 
@@ -177,12 +191,102 @@ func (a *App) listTasks(markers []string, limit, offset int) (TaskList, error) {
 	}
 	a.cacheMu.Unlock()
 
-	patterns := compileTaskPatterns(markers)
 	items := make([]NoteTask, 0, min(limit, 32))
+	patterns := compileTaskPatterns(markers)
 	if len(patterns) == 0 {
 		return TaskList{Items: items, Total: 0, Markers: markers, Limit: limit, Offset: offset}, nil
 	}
 
+	// The incremental index stores exactly the tasks of the configured marker
+	// list, so any subset can be answered without touching note contents. A
+	// request for markers that were never indexed still falls back to the full
+	// scan below to preserve correctness for ad-hoc marker lists.
+	indexed, err := a.TaskMarkers()
+	if err != nil {
+		return TaskList{}, err
+	}
+	var list TaskList
+	if taskMarkersCover(indexed, markers) {
+		list, err = a.listTasksFromIndex(markers, limit, offset)
+	} else {
+		list, err = a.listTasksByScan(patterns, markers, limit, offset)
+	}
+	if err != nil {
+		return TaskList{}, err
+	}
+	a.cacheMu.Lock()
+	a.taskCache = append(a.taskCache, taskPageCache{revision: revision, key: cacheKey, list: list})
+	if len(a.taskCache) > 12 {
+		a.taskCache = a.taskCache[len(a.taskCache)-12:]
+	}
+	a.cacheMu.Unlock()
+	return list, nil
+}
+
+// taskMarkersCover reports whether every requested marker is present in the
+// marker list used to build note_tasks.
+func taskMarkersCover(indexed, requested []string) bool {
+	if len(requested) == 0 {
+		return false
+	}
+	available := make(map[string]struct{}, len(indexed))
+	for _, marker := range indexed {
+		available[marker] = struct{}{}
+	}
+	for _, marker := range requested {
+		if _, found := available[marker]; !found {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) listTasksFromIndex(markers []string, limit, offset int) (TaskList, error) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(markers)), ",")
+	arguments := make([]any, len(markers))
+	for index, marker := range markers {
+		arguments[index] = marker
+	}
+	var total int
+	if err := a.readDB.QueryRow(`SELECT COUNT(*) FROM note_tasks WHERE marker IN (`+placeholders+`)`,
+		arguments...).Scan(&total); err != nil {
+		return TaskList{}, err
+	}
+	queryArguments := append(append([]any{}, arguments...), limit, offset)
+	rows, err := a.readDB.Query(`SELECT n.rowid, n.title, COALESCE(n.folder, ''),
+		t.marker, t.text, t.line, n.updated_at
+		FROM note_tasks t JOIN notes n ON n.rowid = t.note_id
+		WHERE t.marker IN (`+placeholders+`)
+		ORDER BY n.updated_at DESC, n.rowid DESC, t.line ASC, t.marker ASC
+		LIMIT ? OFFSET ?`, queryArguments...)
+	if err != nil {
+		return TaskList{}, err
+	}
+	defer rows.Close()
+	items := make([]NoteTask, 0, min(limit, 32))
+	for rows.Next() {
+		var item NoteTask
+		if err := rows.Scan(&item.NoteID, &item.NoteTitle, &item.Folder,
+			&item.Marker, &item.Text, &item.Line, &item.UpdatedAt); err != nil {
+			return TaskList{}, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return TaskList{}, err
+	}
+	return TaskList{
+		Items:     items,
+		Total:     total,
+		Markers:   markers,
+		Limit:     limit,
+		Offset:    offset,
+		Truncated: total > offset+len(items),
+	}, nil
+}
+
+func (a *App) listTasksByScan(patterns []taskPattern, markers []string, limit, offset int) (TaskList, error) {
+	items := make([]NoteTask, 0, min(limit, 32))
 	// A cheap substring pre-filter avoids copying the full content of notes
 	// that cannot contain any marker. extractTasks still applies the word
 	// boundary rules, so the result is identical.
@@ -232,21 +336,96 @@ func (a *App) listTasks(markers []string, limit, offset int) (TaskList, error) {
 	if err := rows.Err(); err != nil {
 		return TaskList{}, err
 	}
-	list := TaskList{
+	return TaskList{
 		Items:     items,
 		Total:     total,
 		Markers:   markers,
 		Limit:     limit,
 		Offset:    offset,
 		Truncated: total > offset+len(items),
+	}, nil
+}
+
+// replaceNoteTasks refreshes the indexed task lines of one note. It runs in
+// the same transaction as the content write, so the panel never observes a
+// note whose tasks were indexed from an older version.
+func replaceNoteTasks(tx *sql.Tx, noteID int64, content string) error {
+	markers := append([]string(nil), DefaultTaskMarkers...)
+	var raw string
+	err := tx.QueryRow("SELECT value FROM app_settings WHERE key = ?", taskMarkersKey).Scan(&raw)
+	if err == nil {
+		if parsed, parseErr := ParseTaskMarkers(raw); parseErr == nil {
+			markers = parsed
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
 	}
-	a.cacheMu.Lock()
-	a.taskCache = append(a.taskCache, taskPageCache{revision: revision, key: cacheKey, list: list})
-	if len(a.taskCache) > 12 {
-		a.taskCache = a.taskCache[len(a.taskCache)-12:]
+	return replaceNoteTasksWithMarkers(tx, noteID, content, markers)
+}
+
+func replaceNoteTasksWithMarkers(tx *sql.Tx, noteID int64, content string, markers []string) error {
+	if _, err := tx.Exec("DELETE FROM note_tasks WHERE note_id = ?", noteID); err != nil {
+		return err
 	}
-	a.cacheMu.Unlock()
-	return list, nil
+	matches := extractTasksWithPatterns(content, compileTaskPatterns(markers))
+	for _, match := range matches {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO note_tasks(note_id, line, marker, text)
+			VALUES (?, ?, ?, ?)`, noteID, match.Line, match.Marker, match.Text); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rebuildNoteTasks(tx *sql.Tx, markers []string) error {
+	if _, err := tx.Exec("DELETE FROM note_tasks"); err != nil {
+		return err
+	}
+	ids := make([]int64, 0)
+	rows, err := tx.Query("SELECT rowid FROM notes ORDER BY rowid")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		var content string
+		if err := tx.QueryRow("SELECT COALESCE(content, '') FROM notes WHERE rowid = ?", id).
+			Scan(&content); err != nil {
+			return err
+		}
+		if err := replaceNoteTasksWithMarkers(tx, id, content, markers); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func migrateNoteTasks(tx *sql.Tx) error {
+	markers := append([]string(nil), DefaultTaskMarkers...)
+	var raw string
+	err := tx.QueryRow("SELECT value FROM app_settings WHERE key = ?", taskMarkersKey).Scan(&raw)
+	if err == nil {
+		if parsed, parseErr := ParseTaskMarkers(raw); parseErr == nil {
+			markers = parsed
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return rebuildNoteTasks(tx, markers)
 }
 
 type taskPageCache struct {

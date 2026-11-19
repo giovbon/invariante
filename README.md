@@ -213,7 +213,7 @@ Ao anexar um arquivo pelo editor, uma imagem raster compatível é inserida como
 - `GET /api/notes?limit=30&offset=0&folder=...&tag=...`
 - `POST /api/notes`
 - `GET`, `PUT` e `DELETE /api/notes/{id}` (`PUT` aceita `version`; uma versão desatualizada retorna `409` com `{ "error", "note" }`)
-- `GET /api/search?q=...&mode=title|content&limit=30&offset=0&folder=...&tag=...` (`mode` assume `title` quando omitido)
+- `GET /api/search?q=...&mode=title|content&limit=30&offset=0&folder=...&tag=...` (`mode` assume `title` quando omitido; `total_capped: true` indica que o total foi limitado a 1.000 resultados)
 - `GET /api/tags` (nome e contagem de cada tag, sem diferenciar maiúsculas)
 - `GET /api/tasks?markers=TODO,FIXME` (linhas com marcadores de tarefa; sem `markers`, usa os marcadores salvos no servidor)
 - `GET` e `PUT /api/task-markers` (lista de marcadores compartilhada; `PUT` recebe `{ "markers": ["TODO", "LATER"] }`)
@@ -223,7 +223,8 @@ Ao anexar um arquivo pelo editor, uma imagem raster compatível é inserida como
 - `POST /api/folders/rename` com `{ "source": "Projetos/Antiga", "name": "Nova" }`
 - `PATCH /api/notes/{id}/folder` com `{ "folder": "Projetos" }`
 - `GET /api/folder-notes?folder=Projetos&limit=100&offset=0` (inclua `folder=` para listar somente notas sem pasta)
-- `GET /api/notes/{id}/backlinks` e `GET /api/graph`
+- `GET /api/tree-notes?folder=&folder=Projetos&limit=100` (árvore de pastas e notas diretas de todas as pastas expandidas em uma única resposta)
+- `GET /api/notes/{id}/backlinks` e `GET /api/graph` (o grafo aceita `folder=...` e/ou `tag=...` para limitar nós e arestas)
 - `GET /api/backup` (download `.zip`) e `POST /api/backup` (corpo binário do `.zip`)
 - `GET` e `POST /api/notes/{id}/attachments`; `GET` e `DELETE /api/notes/{id}/attachments/{attachment_id}` (upload multipart no campo `file`)
 - `GET /api/auth/status`, `POST /api/auth/login` e `POST /api/auth/logout`

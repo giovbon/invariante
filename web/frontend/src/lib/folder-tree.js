@@ -12,6 +12,7 @@ export function createFolderTree(context) {
         showMessage,
         loadFolders,
         loadFolderNotes,
+        loadTree,
         loadNotes,
         flushSave,
         persistDraft,
@@ -501,6 +502,13 @@ async function refreshFolderTreeFromEvent() {
 
 async function refreshFolderTree() {
     state.folderNotesGeneration++;
+    // One request returns the folder tree and every expanded folder at once,
+    // so the explorer renders a single time instead of once per response.
+    if (typeof loadTree === 'function') {
+        state.folderNotes.clear();
+        await loadTree();
+        return;
+    }
     state.folderNotes.clear();
     await loadFolders();
     const folders = ['', ...state.expandedFolders].filter((folder, index, list) => list.indexOf(folder) === index);

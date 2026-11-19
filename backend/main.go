@@ -31,6 +31,11 @@ const (
 	maxPageSize     = 100
 	maxContentSize  = 5 << 20
 	maxRequestSize  = maxContentSize + (64 << 10)
+	// maxSearchCount caps the COUNT(*) that runs before every search page.
+	// On very large libraries the exact total costs a full FTS scan while the
+	// UI only needs a bounded hint for pagination, so the count stops here and
+	// the response is marked as capped.
+	maxSearchCount = 1000
 )
 
 var ErrVersionConflict = errors.New("note was modified by another session")
@@ -59,10 +64,11 @@ type NoteSummary struct {
 }
 
 type Page struct {
-	Items  []NoteSummary `json:"items"`
-	Total  int           `json:"total"`
-	Limit  int           `json:"limit"`
-	Offset int           `json:"offset"`
+	Items       []NoteSummary `json:"items"`
+	Total       int           `json:"total"`
+	Limit       int           `json:"limit"`
+	Offset      int           `json:"offset"`
+	TotalCapped bool          `json:"total_capped,omitempty"`
 }
 
 type Folder struct {
@@ -88,6 +94,12 @@ type notesPageCache struct {
 }
 
 type searchPageCache struct {
+	revision uint64
+	key      string
+	page     Page
+}
+
+type folderNotesPageCache struct {
 	revision uint64
 	key      string
 	page     Page
@@ -126,13 +138,14 @@ type App struct {
 	// rescan and resolve every link row on each request, which costs hundreds
 	// of milliseconds in large libraries and runs again for every preview
 	// that renders a backlinks block.
-	backlinksCache *noteBacklinkIndex
-	graphCache     *noteGraphCache
-	tagsCache      *tagCountsCache
-	taskCache      []taskPageCache
-	tableCache     []tablePageCache
-	notesCache     []notesPageCache
-	searchCache    []searchPageCache
+	backlinksCache   *noteBacklinkIndex
+	graphCache       *noteGraphCache
+	tagsCache        *tagCountsCache
+	taskCache        []taskPageCache
+	tableCache       []tablePageCache
+	notesCache       []notesPageCache
+	searchCache      []searchPageCache
+	folderNotesCache []folderNotesPageCache
 }
 
 type folderBuilder struct {
@@ -309,6 +322,14 @@ func (a *App) migrate() error {
 			value TEXT NOT NULL,
 			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS note_tasks (
+			note_id INTEGER NOT NULL REFERENCES notes(rowid) ON DELETE CASCADE,
+			line INTEGER NOT NULL,
+			marker TEXT NOT NULL,
+			text TEXT NOT NULL,
+			PRIMARY KEY (note_id, line, marker)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_note_tasks_marker ON note_tasks(marker)`,
 		`CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_id, id)`,
 	}
 	for _, statement := range baseSchema {
@@ -330,6 +351,7 @@ func (a *App) migrate() error {
 		{version: 8, apply: migrateDerivedNoteMetadata},
 		{version: 9, apply: migrateQueryIndexes},
 		{version: 10, apply: migrateAgenda},
+		{version: 11, apply: migrateNoteTasks},
 	}
 	for _, migration := range migrations {
 		var applied int
@@ -629,6 +651,18 @@ func (a *App) ListNotes(folder, tag string, limit, offset int) (Page, error) {
 }
 
 func (a *App) ListFolderNotes(folder string, limit, offset int) (Page, error) {
+	revision := a.currentDataRevision()
+	cacheKey := fmt.Sprintf("%s|%d|%d", folder, limit, offset)
+	a.cacheMu.RLock()
+	for _, entry := range a.folderNotesCache {
+		if entry.revision == revision && entry.key == cacheKey {
+			page := entry.page
+			a.cacheMu.RUnlock()
+			return page, nil
+		}
+	}
+	a.cacheMu.RUnlock()
+
 	var total int
 	if err := a.readDB.QueryRow(`SELECT COUNT(*) FROM notes
 		WHERE folder = ? AND hide_from_explorer = 0`, folder).Scan(&total); err != nil {
@@ -646,7 +680,15 @@ func (a *App) ListFolderNotes(folder string, limit, offset int) (Page, error) {
 	if err != nil {
 		return Page{}, err
 	}
-	return Page{Items: items, Total: total, Limit: limit, Offset: offset}, nil
+	page := Page{Items: items, Total: total, Limit: limit, Offset: offset}
+	a.cacheMu.Lock()
+	a.folderNotesCache = append(a.folderNotesCache,
+		folderNotesPageCache{revision: revision, key: cacheKey, page: page})
+	if len(a.folderNotesCache) > 32 {
+		a.folderNotesCache = a.folderNotesCache[len(a.folderNotesCache)-32:]
+	}
+	a.cacheMu.Unlock()
+	return page, nil
 }
 
 func (a *App) Tags() ([]TagCount, error) {
@@ -719,15 +761,27 @@ func (a *App) SearchNotes(query, mode, folder, tag string, limit, offset int) (P
 }
 
 func (a *App) searchNotesWithMatch(match, mode, folder, tag string, limit, offset int) (Page, error) {
-	var total int
-	if err := a.readDB.QueryRow(`SELECT COUNT(*)
+	// Count at most maxSearchCount+1 rows: enough to know the total is capped
+	// without scanning every FTS match just to render "1.000+" instead of the
+	// exact number.
+	var counted int
+	if err := a.readDB.QueryRow(`SELECT COUNT(*) FROM (
+		SELECT 1
 		FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
 		WHERE notes_fts MATCH ? AND (n.folder = ? OR ? = '')
 		AND (? = '' OR EXISTS (
 			SELECT 1 FROM note_tags nt WHERE nt.note_id = n.rowid AND nt.tag = ?
-		))`,
-		match, folder, folder, tag, tag).Scan(&total); err != nil {
+		))
+		LIMIT ?
+	)`,
+		match, folder, folder, tag, tag, maxSearchCount+1).Scan(&counted); err != nil {
 		return Page{}, err
+	}
+	total := counted
+	capped := false
+	if counted > maxSearchCount {
+		total = maxSearchCount
+		capped = true
 	}
 
 	if mode == "content" {
@@ -748,7 +802,7 @@ func (a *App) searchNotesWithMatch(match, mode, folder, tag string, limit, offse
 		if err != nil {
 			return Page{}, err
 		}
-		return Page{Items: items, Total: total, Limit: limit, Offset: offset}, nil
+		return Page{Items: items, Total: total, Limit: limit, Offset: offset, TotalCapped: capped}, nil
 	}
 
 	rows, err := a.readDB.Query(`SELECT n.rowid, n.title, n.folder, substr(COALESCE(n.content, ''), 1, 180), n.updated_at, COALESCE(n.tags, '')
@@ -767,7 +821,7 @@ func (a *App) searchNotesWithMatch(match, mode, folder, tag string, limit, offse
 	if err != nil {
 		return Page{}, err
 	}
-	return Page{Items: items, Total: total, Limit: limit, Offset: offset}, nil
+	return Page{Items: items, Total: total, Limit: limit, Offset: offset, TotalCapped: capped}, nil
 }
 
 func (a *App) cacheSearchPage(revision uint64, key string, page Page) Page {
@@ -1607,6 +1661,7 @@ func (a *App) Handler(frontendDir string) http.Handler {
 	mux.HandleFunc("/api/folders/rename", a.handleFolderRename)
 	mux.HandleFunc("/api/folders/delete", a.handleFolderDelete)
 	mux.HandleFunc("/api/folder-notes", a.handleFolderNotes)
+	mux.HandleFunc("/api/tree-notes", a.handleTreeNotes)
 	mux.HandleFunc("/api/events", a.handleEvents)
 	mux.HandleFunc("/api/table", a.handleTable)
 	mux.HandleFunc("/api/table-columns", a.handleTableColumns)
@@ -2132,6 +2187,56 @@ func (a *App) handleFolderNotes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+// treeNotesResponse bundles the folder tree with the direct notes of every
+// expanded folder. The explorer used to issue one /api/folder-notes request
+// per expanded folder and re-render after each response; this endpoint keeps
+// that work in one round trip so the tree renders exactly once.
+type treeNotesResponse struct {
+	Folders []Folder        `json:"folders"`
+	Notes   map[string]Page `json:"notes"`
+}
+
+func (a *App) handleTreeNotes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	limit, offset, err := pageParameters(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	revision := a.currentRevision()
+	folders, err := a.FolderTree()
+	if err != nil {
+		log.Printf("load folder tree: %v", err)
+		http.Error(w, "failed to load folders", http.StatusInternalServerError)
+		return
+	}
+	notes := make(map[string]Page)
+	seen := make(map[string]struct{})
+	for _, raw := range r.URL.Query()["folder"] {
+		folder, err := normalizeFolder(raw)
+		if err != nil || folder != raw {
+			http.Error(w, "folder must be a normalized relative path", http.StatusBadRequest)
+			return
+		}
+		if _, duplicate := seen[folder]; duplicate {
+			continue
+		}
+		seen[folder] = struct{}{}
+		page, err := a.ListFolderNotes(folder, limit, offset)
+		if err != nil {
+			log.Printf("list notes in folder %q: %v", folder, err)
+			http.Error(w, "failed to list folder notes", http.StatusInternalServerError)
+			return
+		}
+		notes[folder] = page
+	}
+	w.Header().Set("X-Notes-Revision", strconv.FormatUint(revision, 10))
+	writeJSON(w, http.StatusOK, treeNotesResponse{Folders: folders, Notes: notes})
 }
 
 func pageParameters(r *http.Request) (int, int, error) {
