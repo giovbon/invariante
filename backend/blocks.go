@@ -56,6 +56,19 @@ type expandedNote struct {
 	shifts   []blockLineShift
 }
 
+// noteBlockCacheEntry keeps one generated block for a given data revision.
+// `toc` is not cached because it depends on the note source itself.
+type noteBlockCacheEntry struct {
+	revision uint64
+	key      string
+	body     string
+}
+
+// maxCachedNoteBlocks bounds the block cache. The same `tabela`/`tasks` block
+// often appears in several notes, so a small window is enough to cover the
+// blocks being previewed while typing.
+const maxCachedNoteBlocks = 64
+
 type noteHeading struct {
 	Level int
 	Text  string
@@ -156,6 +169,7 @@ func isArgValueEnd(rest []rune) bool {
 // silently disappearing.
 func (a *App) expandNoteBlocks(source string, ctx noteBlockContext) expandedNote {
 	ctx.Source = source
+	revision := a.currentDataRevision()
 	lines := strings.Split(source, "\n")
 	output := make([]string, 0, len(lines)+8)
 	shifts := make([]blockLineShift, 0, 4)
@@ -173,7 +187,7 @@ func (a *App) expandNoteBlocks(source string, ctx noteBlockContext) expandedNote
 				fmt.Sprintf("limite de %d blocos dinâmicos por nota", maxNoteBlocks)))
 			continue
 		}
-		body := a.renderNoteBlock(match[1], parseBlockArgs(match[2]), ctx)
+		body := a.renderNoteBlockCached(revision, match[1], match[2], ctx)
 		generated := strings.Split(body, "\n")
 		start := index + delta
 		output = append(output, generated...)
@@ -188,6 +202,69 @@ func (a *App) expandNoteBlocks(source string, ctx noteBlockContext) expandedNote
 		}
 	}
 	return expandedNote{markdown: strings.Join(output, "\n"), shifts: shifts}
+}
+
+// renderNoteBlockCached reuses a generated block while the data revision does
+// not change. Blocks such as `tabela` and `recentes` run SQL, and a note with
+// several of them used to query the database on every preview keystroke.
+func (a *App) renderNoteBlockCached(revision uint64, name, rawArgs string, ctx noteBlockContext) string {
+	args := parseBlockArgs(rawArgs)
+	// `toc` is derived from the note body, which changes on every keystroke;
+	// caching it would need the whole source in the key and rarely hit.
+	if name == "toc" {
+		return a.renderNoteBlock(name, args, ctx)
+	}
+	key := noteBlockCacheKey(name, rawArgs, ctx)
+	if body, ok := a.cachedNoteBlock(revision, key); ok {
+		return body
+	}
+	body := a.renderNoteBlock(name, args, ctx)
+	a.storeNoteBlock(revision, key, body)
+	return body
+}
+
+func noteBlockCacheKey(name, rawArgs string, ctx noteBlockContext) string {
+	var builder strings.Builder
+	builder.Grow(len(name) + len(rawArgs) + len(ctx.Title) + len(ctx.Folder) + 24)
+	builder.WriteString(name)
+	builder.WriteByte(0)
+	builder.WriteString(rawArgs)
+	builder.WriteByte(0)
+	builder.WriteString(strconv.FormatInt(ctx.NoteID, 10))
+	builder.WriteByte(0)
+	builder.WriteString(ctx.Title)
+	builder.WriteByte(0)
+	builder.WriteString(ctx.Folder)
+	return builder.String()
+}
+
+func (a *App) cachedNoteBlock(revision uint64, key string) (string, bool) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	for _, entry := range a.blockCache {
+		if entry.revision == revision && entry.key == key {
+			return entry.body, true
+		}
+	}
+	return "", false
+}
+
+func (a *App) storeNoteBlock(revision uint64, key, body string) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	// Drop results from previous revisions before making room, so a burst of
+	// autosaves does not evict the entries that are still useful.
+	kept := a.blockCache[:0]
+	for _, entry := range a.blockCache {
+		if entry.revision == revision {
+			kept = append(kept, entry)
+		}
+	}
+	a.blockCache = kept
+	if len(a.blockCache) >= maxCachedNoteBlocks {
+		a.blockCache = a.blockCache[len(a.blockCache)-maxCachedNoteBlocks+1:]
+	}
+	a.blockCache = append(a.blockCache, noteBlockCacheEntry{revision: revision, key: key, body: body})
 }
 
 func (a *App) renderNoteBlock(name string, args map[string]string, ctx noteBlockContext) string {
@@ -552,7 +629,11 @@ func folderFilter() string {
 }
 
 func tagFilter() string {
-	return "EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND LOWER(nt.tag) = LOWER(?))"
+	// note_tags.tag is declared COLLATE NOCASE, so this comparison is already
+	// case-insensitive and can use idx_note_tags_tag. Wrapping the column in
+	// LOWER() would disable the index and scan note_tags once per candidate
+	// note, which is visible on large libraries.
+	return "EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?)"
 }
 
 // columnFilter builds the row filter of one column. Values are ORed inside the

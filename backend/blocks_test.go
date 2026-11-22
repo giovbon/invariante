@@ -315,3 +315,69 @@ func TestMarkdownHeadingsSkipFrontmatterAndCode(t *testing.T) {
 		t.Fatalf("inline formatting should be stripped: %#v", headings[1])
 	}
 }
+
+func TestTableBlockTagFilterIgnoresCaseAndUsesIndex(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.CreateNote(Note{Title: "Projeto A", Tags: []string{"Projeto"}}); err != nil {
+		t.Fatal(err)
+	}
+	expanded := app.expandNoteBlocks(
+		`<!-- ton618:tabela tag="projeto" colunas="titulo" -->`, noteBlockContext{})
+	if !strings.Contains(expanded.markdown, "Projeto A") {
+		t.Fatalf("tag filter should ignore case: %s", expanded.markdown)
+	}
+
+	rows, err := app.readDB.Query(
+		`EXPLAIN QUERY PLAN SELECT rowid FROM notes WHERE `+tagFilter(), "projeto")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	details := make([]string, 0, 4)
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	plan := strings.Join(details, "\n")
+	// note_tags.tag is COLLATE NOCASE, so `tag = ?` is indexable. Wrapping the
+	// column in LOWER() used to turn this into a full scan of note_tags.
+	if strings.Contains(plan, "SCAN nt") || strings.Contains(plan, "SCAN note_tags") {
+		t.Fatalf("tag filter is not using an index: %s", plan)
+	}
+}
+
+func TestDynamicBlockCacheIsScopedToDataRevision(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.CreateNote(Note{Title: "Primeira"}); err != nil {
+		t.Fatal(err)
+	}
+	first := app.expandNoteBlocks("<!-- ton618:recentes limite=10 -->", noteBlockContext{})
+	if !strings.Contains(first.markdown, "Primeira") {
+		t.Fatalf("recent block is missing the first note: %s", first.markdown)
+	}
+	if len(app.blockCache) == 0 {
+		t.Fatal("dynamic block should be cached")
+	}
+
+	// Insert behind the App's back so the data revision does not change.
+	if _, err := app.db.Exec(`INSERT INTO notes(title, content) VALUES ('Segunda', '')`); err != nil {
+		t.Fatal(err)
+	}
+	second := app.expandNoteBlocks("<!-- ton618:recentes limite=10 -->", noteBlockContext{})
+	if strings.Contains(second.markdown, "Segunda") {
+		t.Fatalf("cached block should be reused within the same revision: %s", second.markdown)
+	}
+
+	app.markDataChanged()
+	third := app.expandNoteBlocks("<!-- ton618:recentes limite=10 -->", noteBlockContext{})
+	if !strings.Contains(third.markdown, "Segunda") {
+		t.Fatalf("cache should be invalidated by a new revision: %s", third.markdown)
+	}
+}

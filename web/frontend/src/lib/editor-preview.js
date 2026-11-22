@@ -3,12 +3,33 @@ import { estimateSourceLine, getScrollSpacerHeight, mapEditorToPreview, mapPrevi
 import { highlightCode } from './syntax-highlight.js';
 import { findLinkOccurrence, linkTargetMatches } from './note-links.js';
 
+// Short notes stay almost immediate; long documents wait a little longer so a
+// burst of typing does not trigger a full server render on every pause.
+export function previewDelay(markdown) {
+    const length = markdown.length;
+    if (length <= 16 * 1024) return 140;
+    if (length <= 128 * 1024) return 220;
+    return 320;
+}
+
+// The preview HTML also depends on the saved title and folder, which the
+// server uses to resolve wikilinks and dynamic blocks. Unsaved title edits
+// must not force a new render, so the key uses the last saved draft.
+function previewContextKey(state) {
+    return [
+        state.noteID ?? '',
+        state.savedDraft?.title ?? '',
+        state.savedDraft?.folder ?? ''
+    ].join('\x00');
+}
+
 // Preview rendering, editor/reading modes and bidirectional scroll sync.
 export function createEditorPreview({ state, elements, closePanel }) {
     let previewTimer;
     let previewRequestID = 0;
     let previewAbortController = null;
     let renderedPreviewMarkdown = '';
+    let renderedPreviewContext = '';
     let editorLinePositionCache = null;
     let scrollSyncFrame = 0;
     let pendingScrollSource = null;
@@ -69,9 +90,16 @@ function destroyMarkmap() {
 }
 
 function resetMarkmapPreview() {
+    const wasMarkmap = elements.markdownPreview.classList.contains('is-markmap');
     destroyMarkmap();
     elements.markdownPreview.classList.remove('is-markmap');
     delete elements.markdownPreview.dataset.noteType;
+    if (wasMarkmap) {
+        // The SVG is not the server-rendered preview, so the next non-markmap
+        // update must fetch even when the Markdown text did not change.
+        renderedPreviewMarkdown = '';
+        renderedPreviewContext = '';
+    }
 }
 
 function scheduleMarkmapPreview(markdown, requestID) {
@@ -92,6 +120,7 @@ async function drawMarkmapPreview(markdown, requestID) {
         destroyMarkmap();
         preview.replaceChildren();
         renderedPreviewMarkdown = markdown;
+        renderedPreviewContext = previewContextKey(state);
         editorLinePositionCache = null;
         pendingReadingLine = null;
 
@@ -187,8 +216,20 @@ function updatePreview() {
         elements.markdownPreview.textContent = '';
         renderFrontmatterProperties();
         renderedPreviewMarkdown = markdown;
+        renderedPreviewContext = previewContextKey(state);
         editorLinePositionCache = null;
         pendingReadingLine = null;
+        syncPreviewMinimumHeight();
+        syncEditorScrollFromSource();
+        runPendingBacklink();
+        runPendingTaskLine();
+        return;
+    }
+    // The server round-trip is only needed when the body or the note context
+    // actually changed. Frontmatter is not part of the preview HTML, so it is
+    // refreshed even when the stripped Markdown is identical.
+    if (markdown === renderedPreviewMarkdown && previewContextKey(state) === renderedPreviewContext) {
+        renderFrontmatterProperties();
         syncPreviewMinimumHeight();
         syncEditorScrollFromSource();
         runPendingBacklink();
@@ -220,6 +261,7 @@ function updatePreview() {
                 renderFrontmatterProperties();
                 syncPreviewMinimumHeight();
                 renderedPreviewMarkdown = markdown;
+                renderedPreviewContext = previewContextKey(state);
                 annotatePreviewLandmarks(markdown);
                 const readingLine = pendingReadingLine;
                 pendingReadingLine = null;
@@ -242,6 +284,7 @@ function updatePreview() {
             if (requestID === previewRequestID) {
                 elements.markdownPreview.textContent = `Falha ao renderizar Markdown: ${error.message}`;
                 renderedPreviewMarkdown = '';
+                renderedPreviewContext = '';
                 pendingReadingLine = null;
                 renderFrontmatterProperties();
                 syncPreviewMinimumHeight();
@@ -250,7 +293,7 @@ function updatePreview() {
         } finally {
             if (previewAbortController === controller) previewAbortController = null;
         }
-    }, 140);
+    }, previewDelay(markdown));
 }
 
 function renderFrontmatterProperties() {
@@ -840,6 +883,7 @@ function scrollToOutlineHeading(line) {
             previewAbortController = null;
             resetMarkmapPreview();
             renderedPreviewMarkdown = '';
+            renderedPreviewContext = '';
             editorLinePositionCache = null;
             scrollSyncSuspendedUntil = 0;
             programmaticScroll = null;
