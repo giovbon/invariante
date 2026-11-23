@@ -195,7 +195,7 @@ func (a *App) noteIndex() (*noteLinkIndex, error) {
 }
 
 func (a *App) backlinkIndex() (*noteBacklinkIndex, error) {
-	revision := a.currentDataRevision()
+	revision := a.currentLinkRevision()
 	a.cacheMu.RLock()
 	cached := a.backlinksCache
 	a.cacheMu.RUnlock()
@@ -250,7 +250,7 @@ func (a *App) backlinkIndex() (*noteBacklinkIndex, error) {
 }
 
 func (a *App) NoteGraph() (NoteGraph, error) {
-	revision := a.currentDataRevision()
+	revision := a.currentLinkRevision()
 	a.cacheMu.RLock()
 	cached := a.graphCache
 	a.cacheMu.RUnlock()
@@ -562,14 +562,20 @@ const maxStoredLinkTarget = 2048
 
 // replaceNoteLinks keeps the persisted raw link targets in sync with the note
 // content. Only the edited note is parsed; target resolution is deferred to
-// NoteGraph and Backlinks so renames stay cheap.
-func replaceNoteLinks(tx *sql.Tx, sourceID int64, content string) error {
+// NoteGraph and Backlinks so renames stay cheap. It reports whether the set of
+// (target, kind) rows changed, so a content save that did not touch any link
+// can keep the backlink and graph caches valid.
+func replaceNoteLinks(tx *sql.Tx, sourceID int64, content string) (bool, error) {
+	previous, err := noteLinkTargets(tx, sourceID)
+	if err != nil {
+		return false, err
+	}
 	if _, err := tx.Exec("DELETE FROM note_links WHERE source_id = ?", sourceID); err != nil {
-		return err
+		return false, err
 	}
 	targets, err := extractNoteLinks(content)
 	if err != nil {
-		return err
+		return false, err
 	}
 	seen := make(map[[2]string]struct{}, len(targets))
 	for _, target := range targets {
@@ -584,10 +590,42 @@ func replaceNoteLinks(tx *sql.Tx, sourceID int64, content string) error {
 		seen[pair] = struct{}{}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO note_links(source_id, target_key, kind)
 			VALUES (?, ?, ?)`, sourceID, key, target.kind); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return replaceNoteTasks(tx, sourceID, content)
+	if err := replaceNoteTasks(tx, sourceID, content); err != nil {
+		return false, err
+	}
+	return !sameLinkTargets(previous, seen), nil
+}
+
+func noteLinkTargets(tx *sql.Tx, sourceID int64) (map[[2]string]struct{}, error) {
+	rows, err := tx.Query(`SELECT target_key, kind FROM note_links WHERE source_id = ?`, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	targets := make(map[[2]string]struct{})
+	for rows.Next() {
+		var key, kind string
+		if err := rows.Scan(&key, &kind); err != nil {
+			return nil, err
+		}
+		targets[[2]string{key, kind}] = struct{}{}
+	}
+	return targets, rows.Err()
+}
+
+func sameLinkTargets(left, right map[[2]string]struct{}) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for target := range left {
+		if _, found := right[target]; !found {
+			return false
+		}
+	}
+	return true
 }
 
 // rewriteIncomingLinks updates the source notes that referenced the renamed
@@ -641,7 +679,7 @@ func rewriteIncomingLinks(tx *sql.Tx, noteID int64, newTitle string, byPath, byT
 			updated_at = datetime('now') WHERE rowid = ?`, rewritten, id); err != nil {
 			return err
 		}
-		if err := replaceNoteLinks(tx, id, rewritten); err != nil {
+		if _, err := replaceNoteLinks(tx, id, rewritten); err != nil {
 			return err
 		}
 	}
@@ -941,7 +979,7 @@ func relinkNotesAfterMove(tx *sql.Tx, before, after []indexedNote, skipSourceID 
 			updated_at = datetime('now') WHERE rowid = ?`, rewritten, id); err != nil {
 			return err
 		}
-		if err := replaceNoteLinks(tx, id, rewritten); err != nil {
+		if _, err := replaceNoteLinks(tx, id, rewritten); err != nil {
 			return err
 		}
 	}

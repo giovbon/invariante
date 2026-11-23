@@ -65,7 +65,14 @@ func staticFiles(root string) http.Handler {
 		}
 		etag := fmt.Sprintf(`W/"%x-%x"`, info.ModTime().UnixNano(), info.Size())
 		w.Header().Set("ETag", etag)
-		w.Header().Set("Cache-Control", "no-cache")
+		cacheControl := "no-cache"
+		if strings.HasPrefix(cleaned, "/vendor/") {
+			// Vendored libraries and fonts are the largest assets (~1.5 MB)
+			// and rarely change. A day of caching avoids revalidating them on
+			// every reload; app code under /src and /styles still revalidates.
+			cacheControl = "public, max-age=86400"
+		}
+		w.Header().Set("Cache-Control", cacheControl)
 		w.Header().Set("Vary", "Accept-Encoding")
 		if header := r.Header.Get("If-None-Match"); header != "" {
 			if etagMatches(header, etag) {

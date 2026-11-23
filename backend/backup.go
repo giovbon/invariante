@@ -782,7 +782,7 @@ func insertRestoredNotes(tx *sql.Tx, notes []backupNote) error {
 			note.Version, createdAt, updatedAt); err != nil {
 			return fmt.Errorf("restore note %d: %w", note.ID, err)
 		}
-		if err := replaceNoteLinks(tx, note.ID, note.Content); err != nil {
+		if _, err := replaceNoteLinks(tx, note.ID, note.Content); err != nil {
 			return err
 		}
 		if err := syncNoteMetadata(tx, note.ID, note.Content, note.Tags); err != nil {

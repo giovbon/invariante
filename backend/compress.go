@@ -2,10 +2,26 @@ package main
 
 import (
 	"compress/gzip"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+// gzipWriters reuses the ~32 KB internal buffer of each gzip.Writer. JSON and
+// JavaScript responses are frequent, and allocating a new writer per request
+// showed up in the allocation profile. Level 5 keeps most of the compression
+// ratio with less CPU than the default level.
+var gzipWriters = sync.Pool{
+	New: func() any {
+		writer, err := gzip.NewWriterLevel(io.Discard, 5)
+		if err != nil {
+			panic(err)
+		}
+		return writer
+	},
+}
 
 // gzipResponses compresses text and JSON responses when the client accepts
 // gzip. The mini app ships ~800 KB of JavaScript and CSS, so this cuts the
@@ -92,7 +108,8 @@ func (w *gzipResponseWriter) Write(data []byte) (int, error) {
 		return w.ResponseWriter.Write(data)
 	}
 	if w.writer == nil {
-		w.writer = gzip.NewWriter(w.ResponseWriter)
+		w.writer = gzipWriters.Get().(*gzip.Writer)
+		w.writer.Reset(w.ResponseWriter)
 	}
 	return w.writer.Write(data)
 }
@@ -109,6 +126,11 @@ func (w *gzipResponseWriter) Flush() {
 func (w *gzipResponseWriter) close() {
 	if w.writer != nil {
 		_ = w.writer.Close()
+		// Drop the reference to the response writer before pooling the
+		// compressor; otherwise the pool would keep whole responses alive.
+		w.writer.Reset(io.Discard)
+		gzipWriters.Put(w.writer)
+		w.writer = nil
 	}
 }
 

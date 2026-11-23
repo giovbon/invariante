@@ -910,6 +910,67 @@ func TestTagFilteringAndTagList(t *testing.T) {
 	}
 }
 
+func TestListNotesFiltersFolderAndTagTogether(t *testing.T) {
+	app, err := NewApp(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	creates := []Note{
+		{Title: "A", Folder: "Pasta", Tags: []string{"x"}},
+		{Title: "B", Folder: "Pasta", Tags: []string{"y"}},
+		{Title: "C", Folder: "Outra", Tags: []string{"x"}},
+		{Title: "D", Folder: "Pasta/Sub", Tags: []string{"x"}},
+	}
+	for _, note := range creates {
+		if _, err := app.CreateNote(note); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, err := app.ListNotes("Pasta", "x", 30, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].Title != "A" {
+		t.Fatalf("folder and tag should intersect exactly: %#v", page)
+	}
+
+	page, err = app.ListNotes("Pasta", "", 30, 0)
+	if err != nil || page.Total != 2 {
+		t.Fatalf("folder filter should be exact, not a prefix: %#v err=%v", page, err)
+	}
+
+	page, err = app.ListNotes("", "x", 30, 0)
+	if err != nil || page.Total != 3 {
+		t.Fatalf("tag filter should not be restricted by folder: %#v err=%v", page, err)
+	}
+
+	items, total, err := app.listTableNotes("Pasta", "x", 30, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(items) != 1 || items[0].Title != "A" {
+		t.Fatalf("table view should apply the same filters: total=%d items=%#v", total, items)
+	}
+
+	first, err := app.ListNotes("", "x", 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := app.ListNotes("", "x", 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Total != 3 || second.Total != 3 || len(first.Items) != 1 || len(second.Items) != 1 {
+		t.Fatalf("pagination totals should be stable: %#v %#v", first, second)
+	}
+	if first.Items[0].ID == second.Items[0].ID {
+		t.Fatalf("pages should not repeat the same note: %#v %#v", first.Items, second.Items)
+	}
+}
+
 func TestBackupRoundTripRestoresNotesAndAttachments(t *testing.T) {
 	app, err := NewApp(t.TempDir())
 	if err != nil {
@@ -1303,9 +1364,9 @@ func TestMigrationBackfillsPersistedLinksIdempotently(t *testing.T) {
 			app.Close()
 			t.Fatal(err)
 		}
-		if version != 11 {
+		if version != 12 {
 			app.Close()
-			t.Fatalf("schema version = %d, want 11", version)
+			t.Fatalf("schema version = %d, want 12", version)
 		}
 		if err := app.Close(); err != nil {
 			t.Fatal(err)

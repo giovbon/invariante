@@ -86,6 +86,11 @@ func TestStaticFilesExposeOnlyPublicFrontendPaths(t *testing.T) {
 	if cacheControl := first.Header().Get("Cache-Control"); cacheControl != "no-cache" {
 		t.Fatalf("Cache-Control = %q, want no-cache", cacheControl)
 	}
+	vendor := httptest.NewRecorder()
+	handler.ServeHTTP(vendor, httptest.NewRequest(http.MethodGet, "/vendor/highlight.js/x.js", nil))
+	if cacheControl := vendor.Header().Get("Cache-Control"); cacheControl != "public, max-age=86400" {
+		t.Fatalf("vendor Cache-Control = %q, want public, max-age=86400", cacheControl)
+	}
 	conditional := httptest.NewRequest(http.MethodGet, "/src/main.js", nil)
 	conditional.Header.Set("If-None-Match", etag)
 	second := httptest.NewRecorder()

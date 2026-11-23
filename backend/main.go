@@ -133,6 +133,11 @@ type App struct {
 	// never serve stale graph, tag or link data.
 	cacheMu      sync.RWMutex
 	dataRevision uint64
+	// linkRevision advances only when the link graph can change: link rows,
+	// titles, folders, note creation/deletion or a restore. A content save
+	// that keeps the same wikilinks must not invalidate the backlink and graph
+	// caches, which otherwise rebuild on every autosave.
+	linkRevision uint64
 	linkIndex    *noteLinkIndex
 	// backlinkIndex groups note_links by resolved target. Backlinks used to
 	// rescan and resolve every link row on each request, which costs hundreds
@@ -280,6 +285,20 @@ func (a *App) keepNoteIndexFresh() {
 func (a *App) markDataChanged() {
 	a.cacheMu.Lock()
 	a.dataRevision++
+	a.linkRevision++
+	a.cacheMu.Unlock()
+}
+
+// markContentChanged advances the general revision after a save that did not
+// change the note title or folder. The link revision only advances when the
+// note's link rows actually changed, so backlinks and the graph survive
+// ordinary content autosaves.
+func (a *App) markContentChanged(linksChanged bool) {
+	a.cacheMu.Lock()
+	a.dataRevision++
+	if linksChanged {
+		a.linkRevision++
+	}
 	a.cacheMu.Unlock()
 }
 
@@ -287,6 +306,12 @@ func (a *App) currentDataRevision() uint64 {
 	a.cacheMu.RLock()
 	defer a.cacheMu.RUnlock()
 	return a.dataRevision
+}
+
+func (a *App) currentLinkRevision() uint64 {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	return a.linkRevision
 }
 
 func (a *App) migrate() error {
@@ -357,6 +382,7 @@ func (a *App) migrate() error {
 		{version: 9, apply: migrateQueryIndexes},
 		{version: 10, apply: migrateAgenda},
 		{version: 11, apply: migrateNoteTasks},
+		{version: 12, apply: migrateNoteListIndexes},
 	}
 	for _, migration := range migrations {
 		var applied int
@@ -481,7 +507,7 @@ func migrateNoteLinks(tx *sql.Tx) error {
 		if err := tx.QueryRow("SELECT COALESCE(content, '') FROM notes WHERE rowid = ?", id).Scan(&content); err != nil {
 			return err
 		}
-		if err := replaceNoteLinks(tx, id, content); err != nil {
+		if _, err := replaceNoteLinks(tx, id, content); err != nil {
 			return err
 		}
 	}
@@ -579,6 +605,16 @@ func migrateQueryIndexes(tx *sql.Tx) error {
 	return nil
 }
 
+// migrateNoteListIndexes adds the composite index used by folder-scoped
+// listings. With only idx_notes_folder, SQLite read every note in the folder
+// and sorted them in a temporary B-tree; the composite index returns them in
+// the exact ORDER BY used by the list.
+func migrateNoteListIndexes(tx *sql.Tx) error {
+	_, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_notes_folder_updated
+		ON notes(folder, updated_at DESC, rowid DESC)`)
+	return err
+}
+
 // migrateAgenda adds the standalone agenda and the notification log that
 // keeps reminders idempotent across restarts.
 func migrateAgenda(tx *sql.Tx) error {
@@ -608,35 +644,76 @@ func migrateAgenda(tx *sql.Tx) error {
 	return nil
 }
 
+// noteListFilter builds the optional WHERE clause shared by the note list and
+// the table view. Building it dynamically instead of comparing the folder with
+// an always-true fallback lets SQLite use the folder index: the fallback form
+// made it scan every note in updated order and probe note_tags for each one,
+// which cost ~38ms for a folder+tag page in a 10k-note library.
+func noteListFilter(folder, tag string) (string, []any) {
+	clauses := make([]string, 0, 2)
+	args := make([]any, 0, 2)
+	if folder != "" {
+		clauses = append(clauses, "folder = ?")
+		args = append(args, folder)
+	}
+	if tag != "" {
+		clauses = append(clauses, `EXISTS (
+			SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?
+		)`)
+		args = append(args, tag)
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args
+}
+
+// noteCountQuery counts the same rows as noteListFilter. When a tag is
+// selected it starts from note_tags and joins notes, so counting does not scan
+// the whole library; the EXISTS form used by the list is slower for COUNT(*)
+// because there is no LIMIT to stop it early.
+func noteCountQuery(folder, tag string) (string, []any) {
+	if tag != "" {
+		query := `SELECT COUNT(*) FROM notes JOIN note_tags nt ON nt.note_id = notes.rowid
+			WHERE nt.tag = ?`
+		args := []any{tag}
+		if folder != "" {
+			query += " AND notes.folder = ?"
+			args = append(args, folder)
+		}
+		return query, args
+	}
+	query := `SELECT COUNT(*) FROM notes`
+	args := make([]any, 0, 1)
+	if folder != "" {
+		query += " WHERE folder = ?"
+		args = append(args, folder)
+	}
+	return query, args
+}
+
 func (a *App) ListNotes(folder, tag string, limit, offset int) (Page, error) {
 	revision := a.currentDataRevision()
 	cacheKey := fmt.Sprintf("%s\x00%s|%d|%d", folder, tag, limit, offset)
-	a.cacheMu.Lock()
+	a.cacheMu.RLock()
 	for _, entry := range a.notesCache {
 		if entry.revision == revision && entry.key == cacheKey {
 			page := entry.page
-			a.cacheMu.Unlock()
+			a.cacheMu.RUnlock()
 			return page, nil
 		}
 	}
-	a.cacheMu.Unlock()
+	a.cacheMu.RUnlock()
 	var total int
-	if err := a.readDB.QueryRow(`SELECT COUNT(*) FROM notes
-		WHERE (folder = ? OR ? = '')
-		AND (? = '' OR EXISTS (
-			SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?
-		))`,
-		folder, folder, tag, tag).Scan(&total); err != nil {
+	countQuery, countArgs := noteCountQuery(folder, tag)
+	if err := a.readDB.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
 		return Page{}, err
 	}
+	filter, filterArgs := noteListFilter(folder, tag)
+	args := append(filterArgs, limit, offset)
 	rows, err := a.readDB.Query(`SELECT rowid, title, folder, substr(COALESCE(content, ''), 1, 180), updated_at, COALESCE(tags, '')
-		FROM notes
-		WHERE (folder = ? OR ? = '')
-		AND (? = '' OR EXISTS (
-			SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?
-		))
-		ORDER BY updated_at DESC, rowid DESC LIMIT ? OFFSET ?`,
-		folder, folder, tag, tag, limit, offset)
+		FROM notes`+filter+`
+		ORDER BY updated_at DESC, rowid DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return Page{}, err
 	}
@@ -790,15 +867,28 @@ func (a *App) searchNotesWithMatch(match, mode, folder, tag string, limit, offse
 	}
 
 	if mode == "content" {
-		rows, err := a.readDB.Query(`SELECT n.rowid, n.title, n.folder,
-			highlight(notes_fts, 1, char(30), char(31)), n.updated_at, COALESCE(n.tags, '')
-			FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
-			WHERE notes_fts MATCH ? AND (n.folder = ? OR ? = '')
-			AND (? = '' OR EXISTS (
-				SELECT 1 FROM note_tags nt WHERE nt.note_id = n.rowid AND nt.tag = ?
-			))
-			ORDER BY notes_fts.rank, n.updated_at DESC, n.rowid DESC LIMIT ? OFFSET ?`,
-			match, folder, folder, tag, tag, limit, offset)
+		// The CTE picks the page by rank before the expensive columns are
+		// evaluated. Ordering the full result directly made SQLite compute
+		// highlight() for every match and sort all of them: with 10k matches
+		// that cost ~475ms instead of ~70ms. The outer MATCH is required for
+		// highlight() to know the query terms.
+		rows, err := a.readDB.Query(`WITH top AS (
+				SELECT notes_fts.rowid AS rowid, notes_fts.rank AS rank
+				FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
+				WHERE notes_fts MATCH ? AND (n.folder = ? OR ? = '')
+				AND (? = '' OR EXISTS (
+					SELECT 1 FROM note_tags nt WHERE nt.note_id = n.rowid AND nt.tag = ?
+				))
+				ORDER BY notes_fts.rank, n.updated_at DESC, n.rowid DESC
+				LIMIT ? OFFSET ?
+			)
+			SELECT n.rowid, n.title, n.folder,
+				highlight(notes_fts, 1, char(30), char(31)), n.updated_at, COALESCE(n.tags, '')
+			FROM top
+			JOIN notes_fts ON notes_fts.rowid = top.rowid AND notes_fts MATCH ?
+			JOIN notes n ON n.rowid = top.rowid
+			ORDER BY top.rank, n.updated_at DESC, n.rowid DESC`,
+			match, folder, folder, tag, tag, limit, offset, match)
 		if err != nil {
 			return Page{}, err
 		}
@@ -810,13 +900,19 @@ func (a *App) searchNotesWithMatch(match, mode, folder, tag string, limit, offse
 		return Page{Items: items, Total: total, Limit: limit, Offset: offset, TotalCapped: capped}, nil
 	}
 
-	rows, err := a.readDB.Query(`SELECT n.rowid, n.title, n.folder, substr(COALESCE(n.content, ''), 1, 180), n.updated_at, COALESCE(n.tags, '')
-		FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
-		WHERE notes_fts MATCH ? AND (n.folder = ? OR ? = '')
-		AND (? = '' OR EXISTS (
-			SELECT 1 FROM note_tags nt WHERE nt.note_id = n.rowid AND nt.tag = ?
-		))
-		ORDER BY notes_fts.rank, n.updated_at DESC, n.rowid DESC LIMIT ? OFFSET ?`,
+	rows, err := a.readDB.Query(`WITH top AS (
+			SELECT notes_fts.rowid AS rowid, notes_fts.rank AS rank
+			FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
+			WHERE notes_fts MATCH ? AND (n.folder = ? OR ? = '')
+			AND (? = '' OR EXISTS (
+				SELECT 1 FROM note_tags nt WHERE nt.note_id = n.rowid AND nt.tag = ?
+			))
+			ORDER BY notes_fts.rank, n.updated_at DESC, n.rowid DESC
+			LIMIT ? OFFSET ?
+		)
+		SELECT n.rowid, n.title, n.folder, substr(COALESCE(n.content, ''), 1, 180), n.updated_at, COALESCE(n.tags, '')
+		FROM top JOIN notes n ON n.rowid = top.rowid
+		ORDER BY top.rank, n.updated_at DESC, n.rowid DESC`,
 		match, folder, folder, tag, tag, limit, offset)
 	if err != nil {
 		return Page{}, err
@@ -1118,7 +1214,7 @@ func (a *App) CreateNote(note Note) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := replaceNoteLinks(tx, id, note.Content); err != nil {
+	if _, err := replaceNoteLinks(tx, id, note.Content); err != nil {
 		return 0, err
 	}
 	if err := syncNoteMetadata(tx, id, note.Content, note.Tags); err != nil {
@@ -1187,7 +1283,8 @@ func (a *App) UpdateNote(id int64, note Note) error {
 			return err
 		}
 	}
-	if err := replaceNoteLinks(tx, id, note.Content); err != nil {
+	linksChanged, err := replaceNoteLinks(tx, id, note.Content)
+	if err != nil {
 		return err
 	}
 	if err := syncNoteMetadata(tx, id, note.Content, note.Tags); err != nil {
@@ -1196,12 +1293,13 @@ func (a *App) UpdateNote(id int64, note Note) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	a.markDataChanged()
 	if titleChanged || folderChanged {
+		a.markDataChanged()
 		a.notifyChange()
 	} else {
 		// The note index only stores IDs, titles and folders, so a pure
 		// content/tags save leaves it valid.
+		a.markContentChanged(linksChanged)
 		a.keepNoteIndexFresh()
 	}
 	return nil

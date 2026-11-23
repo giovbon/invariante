@@ -34,11 +34,11 @@ func benchmarkNoteContent(index int) string {
 // seedBenchmarkLibrary inserts the synthetic notes in a single transaction.
 // It mirrors CreateNote (link index and derived metadata) so the benchmark
 // measures the same database shape as a library built through the API.
-func seedBenchmarkLibrary(b *testing.B, app *App) []int64 {
-	b.Helper()
+func seedBenchmarkLibrary(tb testing.TB, app *App) []int64 {
+	tb.Helper()
 	tx, err := app.db.Begin()
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	defer tx.Rollback()
 	ids := make([]int64, 0, benchmarkNoteCount)
@@ -50,22 +50,22 @@ func seedBenchmarkLibrary(b *testing.B, app *App) []int64 {
 			fmt.Sprintf("Nota %05d", index), content,
 			fmt.Sprintf("Pasta %02d", index%40), strings.Join(tags, ","))
 		if err != nil {
-			b.Fatal(err)
+			tb.Fatal(err)
 		}
 		id, err := result.LastInsertId()
 		if err != nil {
-			b.Fatal(err)
+			tb.Fatal(err)
 		}
-		if err := replaceNoteLinks(tx, id, content); err != nil {
-			b.Fatal(err)
+		if _, err := replaceNoteLinks(tx, id, content); err != nil {
+			tb.Fatal(err)
 		}
 		if err := syncNoteMetadata(tx, id, content, tags); err != nil {
-			b.Fatal(err)
+			tb.Fatal(err)
 		}
 		ids = append(ids, id)
 	}
 	if err := tx.Commit(); err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	app.markDataChanged()
 	return ids
@@ -116,6 +116,26 @@ func BenchmarkLibrary(b *testing.B) {
 		}
 	})
 
+	b.Run("ListNotes/folder/cold", func(b *testing.B) {
+		b.ReportAllocs()
+		for index := 0; index < b.N; index++ {
+			app.markDataChanged()
+			if _, err := app.ListNotes("Pasta 07", "", defaultPageSize, 0); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("ListNotes/tag/cold", func(b *testing.B) {
+		b.ReportAllocs()
+		for index := 0; index < b.N; index++ {
+			app.markDataChanged()
+			if _, err := app.ListNotes("", "tag-07", defaultPageSize, 0); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
 	b.Run("ListNotes/folder+tag/cold", func(b *testing.B) {
 		b.ReportAllocs()
 		for index := 0; index < b.N; index++ {
@@ -136,6 +156,16 @@ func BenchmarkLibrary(b *testing.B) {
 		}
 	})
 
+	b.Run("SearchNotes/title-broad", func(b *testing.B) {
+		b.ReportAllocs()
+		for index := 0; index < b.N; index++ {
+			app.markDataChanged()
+			if _, err := app.SearchNotes("Nota", "title", "", "", defaultPageSize, 0); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
 	b.Run("SearchNotes/content", func(b *testing.B) {
 		b.ReportAllocs()
 		for index := 0; index < b.N; index++ {
@@ -151,6 +181,40 @@ func BenchmarkLibrary(b *testing.B) {
 		for index := 0; index < b.N; index++ {
 			updated.Content = benchmarkNoteContent(int(noteID) + index)
 			if err := app.UpdateNote(noteID, updated); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("Backlinks/content-save", func(b *testing.B) {
+		b.ReportAllocs()
+		for index := 0; index < b.N; index++ {
+			// Content-only saves that keep the same wikilinks must not rebuild
+			// the backlink index.
+			app.markContentChanged(false)
+			app.keepNoteIndexFresh()
+			if _, err := app.Backlinks(noteID); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("Backlinks/link-change", func(b *testing.B) {
+		b.ReportAllocs()
+		for index := 0; index < b.N; index++ {
+			app.markContentChanged(true)
+			app.keepNoteIndexFresh()
+			if _, err := app.Backlinks(noteID); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("Backlinks/title-change", func(b *testing.B) {
+		b.ReportAllocs()
+		for index := 0; index < b.N; index++ {
+			app.markDataChanged()
+			if _, err := app.Backlinks(noteID); err != nil {
 				b.Fatal(err)
 			}
 		}

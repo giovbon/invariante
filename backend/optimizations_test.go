@@ -491,7 +491,29 @@ func TestBacklinkIndexTracksLinkChanges(t *testing.T) {
 
 	wantBacklinks("initial", 1)
 
+	app.cacheMu.RLock()
+	warmCache := app.backlinksCache
+	app.cacheMu.RUnlock()
+	if warmCache == nil {
+		t.Fatal("backlink index was not cached")
+	}
 	source, err := app.GetNote(sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.Content = "[[Alvo]] com mais texto"
+	if err := app.UpdateNote(sourceID, source); err != nil {
+		t.Fatal(err)
+	}
+	app.cacheMu.RLock()
+	sameCache := app.backlinksCache
+	app.cacheMu.RUnlock()
+	if sameCache != warmCache {
+		t.Fatal("content save with the same links rebuilt the backlink index")
+	}
+	wantBacklinks("content changed", 1)
+
+	source, err = app.GetNote(sourceID)
 	if err != nil {
 		t.Fatal(err)
 	}

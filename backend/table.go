@@ -60,22 +60,17 @@ func (a *App) listTableNotes(folder, tag string, limit, offset int) ([]TableNote
 		a.cacheMu.Unlock()
 	}
 	var total int
-	if err := a.readDB.QueryRow(`SELECT COUNT(*) FROM notes
-		WHERE (folder = ? OR ? = '')
-		AND (? = '' OR EXISTS (
-			SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?
-		))`, folder, folder, tag, tag).Scan(&total); err != nil {
+	countQuery, countArgs := noteCountQuery(folder, tag)
+	if err := a.readDB.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
+	filter, filterArgs := noteListFilter(folder, tag)
+	args := append(filterArgs, limit, offset)
 	rows, err := a.readDB.Query(`SELECT rowid, title, folder, COALESCE(tags, ''),
 		COALESCE(frontmatter, '{}'), created_at, updated_at
-		FROM notes
-		WHERE (folder = ? OR ? = '')
-		AND (? = '' OR EXISTS (
-			SELECT 1 FROM note_tags nt WHERE nt.note_id = notes.rowid AND nt.tag = ?
-		))
+		FROM notes`+filter+`
 		ORDER BY updated_at DESC, rowid DESC LIMIT ? OFFSET ?`,
-		folder, folder, tag, tag, limit, offset)
+		args...)
 	if err != nil {
 		return nil, 0, err
 	}

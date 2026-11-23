@@ -43,3 +43,24 @@ test('escapes code for unknown languages and when Highlight.js is unavailable', 
     delete globalThis.hljs;
     assert.equal(highlightCode('<script>', 'js'), '&lt;script&gt;');
 });
+
+test('reuses highlighted HTML for identical blocks', () => {
+    const original = globalThis.hljs;
+    let calls = 0;
+    globalThis.hljs = {
+        getLanguage: () => ({}),
+        highlight(source, options) {
+            calls += 1;
+            return { value: `<span data-lang="${options.language}">${source}</span>` };
+        }
+    };
+    try {
+        const first = highlightCode('const cached = 1;', 'JavaScript');
+        const second = highlightCode('const cached = 1;', 'javascript');
+        assert.equal(first, second);
+        assert.equal(calls, 1);
+    } finally {
+        if (original === undefined) delete globalThis.hljs;
+        else globalThis.hljs = original;
+    }
+});
