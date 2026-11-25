@@ -1106,12 +1106,12 @@ function handlePanelClick(event) {
         event.stopPropagation();
         document.body.classList.add('panel-open');
         const folder = toggle.dataset.toggleFolder;
-        if (state.expandedFolders.has(folder)) state.expandedFolders.delete(folder);
-        else {
-            state.expandedFolders.add(folder);
-            void loadFolderNotes(folder);
-        }
-        folderTree.render();
+        const expanded = !state.expandedFolders.has(folder);
+        if (expanded) state.expandedFolders.add(folder);
+        else state.expandedFolders.delete(folder);
+        // Updating just this node keeps large trees responsive. Expanding an
+        // unloaded folder renders its skeleton, which triggers the fetch.
+        if (!folderTree.setExpanded(folder, expanded)) folderTree.render();
         return;
     }
     const more = event.target.closest('[data-more-folder]');
@@ -1188,7 +1188,7 @@ async function loadFolderNotes(folder, more = false) {
         if (generation !== state.folderNotesGeneration) return;
         const items = more && previous ? [...previous.items, ...page.items] : page.items;
         state.folderNotes.set(folder, { items, total: page.total });
-        if (elements.panel.dataset.panel === 'files') folderTree.render();
+        if (elements.panel.dataset.panel === 'files') folderTree.refreshFolder(folder);
     } catch (error) {
         showMessage(`Não foi possível carregar as notas da pasta: ${error.message}`, 'error');
     } finally {
@@ -1668,11 +1668,19 @@ function createAutomaticNoteTitle(date = new Date()) {
 }
 
 async function openNote(id, { push = true, backlinkTarget = null, heading = '', line = null } = {}) {
+    // Fetch the target note while a pending autosave of the current one is
+    // flushed. Both requests are independent and the save can take a full
+    // round-trip, which used to delay every note switch made while typing.
+    // Reopening the same note keeps the sequential order so the fetched copy
+    // already contains the flushed changes.
+    const canPrefetch = !(state.view === 'editor' && state.noteID === id);
+    const noteRequest = canPrefetch ? requestJSON(`/api/notes/${id}`) : null;
+    noteRequest?.catch(() => {});
     if (state.view === 'editor' && !(await saveSession.flush())) return;
     const navigationID = ++state.navigationID;
     let listState = state.view === 'editor' ? state.listState : captureListState();
     try {
-        const note = await requestJSON(`/api/notes/${id}`);
+        const note = noteRequest ? await noteRequest : await requestJSON(`/api/notes/${id}`);
         if (navigationID !== state.navigationID) return;
         state.listState = listState;
         if (push) {
@@ -1725,16 +1733,18 @@ function showEditor(note) {
     state.outline = extractMarkdownOutline(content);
     sidePanels.updateOutlineCount();
     editorPreview.resetViewState();
-    elements.noteContent.value = content;
-    state.savedDraft = saveSession.getDraft();
     markdownEditor.setValue(content, { silent: true });
-    syncMarkdownHighlight();
+    state.savedDraft = saveSession.getDraft();
     const savedMode = localStorage.getItem('editorMode');
     const preferredMode = ['edit', 'split', 'preview'].includes(savedMode) ? savedMode : 'split';
     editorPreview.setMode(window.matchMedia('(max-width: 700px)').matches && preferredMode === 'split'
         ? 'edit'
-        : preferredMode);
-    editorPreview.update();
+        : preferredMode, { render: false });
+    // Start the preview request before rebuilding the editor highlight: the
+    // server renders while the browser builds the overlay, and the note opens
+    // without waiting for the typing debounce.
+    editorPreview.update({ immediate: true });
+    syncMarkdownHighlight();
     // Setting a textarea's value puts the caret at the end in Chromium, and
     // focusing it then scrolls the editor (and, through scroll sync, the
     // preview) to the last line. Reset the caret and both panes so long notes

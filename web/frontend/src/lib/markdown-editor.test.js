@@ -498,6 +498,14 @@ test('does not expose malformed or absent frontmatter as properties', () => {
     assert.equal(parseFrontmatter('---\n---\n# Note'), null);
 });
 
+test('reuses the last parsed frontmatter only while the document is unchanged', () => {
+    const first = parseFrontmatter('---\ntags: pkm\n---\nBody');
+    assert.equal(parseFrontmatter('---\ntags: pkm\n---\nBody'), first);
+    assert.deepEqual(parseFrontmatter('---\ntags: outro\n---\nBody'), { tags: 'outro' });
+    assert.equal(noteType('---\ntags: outro\n---\nBody'), '');
+    assert.deepEqual(parseFrontmatter('---\ntags: pkm\n---\nBody'), { tags: 'pkm' });
+});
+
 test('reads the note type from frontmatter and opts into markmap', () => {
     assert.equal(noteType('---\nnote-type: markmap\n---\n# Map'), 'markmap');
     assert.equal(noteType('---\nnote-type: "MarkMap"\n---\n# Map'), 'markmap');

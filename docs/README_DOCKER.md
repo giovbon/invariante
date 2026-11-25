@@ -22,7 +22,7 @@ Configuração para rodar localmente:
 - **Build**: Constrói usando o Dockerfile; a plataforma é escolhida pelo Docker/buildx (sem `platforms` fixo)
 - **Porta**: 8000 (padrão API)
 - **Dados**: Persistência via volume `./data:/app/data`
-- **Environment**: `PORT`, `NOTES_DIR` e variáveis opcionais de autenticação (`AUTHENTICATION_PASSWORD`, `AUTHENTICATION_COOKIE_SECURE`); o tema é escolhido na interface e salvo no navegador
+- **Environment**: `PORT`, `NOTES_DIR` e variáveis opcionais de autenticação (`AUTHENTICATION_PASSWORD`, `AUTHENTICATION_SESSION_TTL`, `AUTHENTICATION_COOKIE_SECURE`); a chave de sessão é persistida em `auth.key` no volume de dados; o tema é escolhido na interface e salvo no navegador
 
 ### 3. build-and-push.sh
 **Localização:** `/mnt/c/Users/Giovani/Desktop/projeto-pkm-main/build-and-push.sh`

@@ -11,8 +11,9 @@ usage() {
 Usage: ./run.sh [--data-dir PATH] [--port PORT]
   --data-dir  Directory for SQLite notes (default: NOTES_DIR or ./data)
   --port      HTTP port (default: 8000, or PORT environment variable)
-  Set AUTHENTICATION_PASSWORD to require login. Behind a TLS proxy, also set
-  AUTHENTICATION_COOKIE_SECURE=true.
+  Set AUTHENTICATION_PASSWORD to require login. Sessions last 30 days by
+  default and survive restarts; override with AUTHENTICATION_SESSION_TTL
+  (e.g. 720h). Behind a TLS proxy, also set AUTHENTICATION_COOKIE_SECURE=true.
   --help      Show this help
 
 An existing TON-618 process listening on the selected port is stopped before

@@ -15,6 +15,9 @@ services:
       - NOTES_DIR=/app/data
       # Autenticação opcional: basta definir uma senha forte.
       # - AUTHENTICATION_PASSWORD=troque-esta-senha
+      # Duração da sessão (padrão: 720h). A chave fica em /app/data/auth.key,
+      # então reiniciar o container não exige novo login.
+      # - AUTHENTICATION_SESSION_TTL=720h
       # Habilite somente quando o navegador acessar o app por HTTPS.
       # - AUTHENTICATION_COOKIE_SECURE=true
       # Captura de mensagens de um tópico ntfy na pasta Inbox.

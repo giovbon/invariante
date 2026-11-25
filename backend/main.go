@@ -201,10 +201,21 @@ func NewApp(dataDir string) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("create attachment storage: %w", err)
 	}
-	app.auth, err = newAuthenticator(os.Getenv("AUTHENTICATION_PASSWORD"))
+	app.auth, err = newAuthenticator(
+		os.Getenv("AUTHENTICATION_PASSWORD"),
+		filepath.Join(dataDir, "auth.key"),
+	)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize authentication: %w", err)
+	}
+	if configured := os.Getenv("AUTHENTICATION_SESSION_TTL"); configured != "" {
+		ttl, err := time.ParseDuration(configured)
+		if err != nil || ttl <= 0 {
+			db.Close()
+			return nil, fmt.Errorf("parse AUTHENTICATION_SESSION_TTL: %q is not a positive duration", configured)
+		}
+		app.auth.ttl = ttl
 	}
 	if configured := os.Getenv("AUTHENTICATION_COOKIE_SECURE"); configured != "" {
 		app.auth.secure, err = strconv.ParseBool(configured)

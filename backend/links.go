@@ -210,20 +210,29 @@ func (a *App) backlinkIndex() (*noteBacklinkIndex, error) {
 	for _, note := range index.notes {
 		notesByID[note.ID] = note
 	}
-	rows, err := a.readDB.Query(`SELECT source_id, target_key FROM note_links
-		ORDER BY source_id, target_key`)
-	if err != nil {
+	var raw string
+	// One row instead of one cgo callback per link. The length prefix keeps
+	// arbitrary target keys intact and removes the need for ORDER BY.
+	if err := a.readDB.QueryRow(`SELECT COALESCE(group_concat(
+		source_id || ',' || length(CAST(target_key AS BLOB)) || ',' || target_key, ''), '')
+		FROM note_links`).Scan(&raw); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	sources := make(map[int64][]int64)
 	seen := make(map[[2]int64]struct{})
-	for rows.Next() {
-		var sourceID int64
-		var targetKey string
-		if err := rows.Scan(&sourceID, &targetKey); err != nil {
-			return nil, err
+	for pos := 0; pos < len(raw); {
+		sourceID, next, ok := readDecimalField(raw, pos)
+		if !ok {
+			return nil, errors.New("invalid note link payload")
 		}
+		targetLength, targetStart, ok := readDecimalField(raw, next)
+		if !ok || targetLength > int64(len(raw)-targetStart) {
+			return nil, errors.New("invalid note link payload")
+		}
+		targetEnd := targetStart + int(targetLength)
+		targetKey := raw[targetStart:targetEnd]
+		pos = targetEnd
+
 		source, exists := notesByID[sourceID]
 		if !exists {
 			continue
@@ -238,9 +247,6 @@ func (a *App) backlinkIndex() (*noteBacklinkIndex, error) {
 		}
 		seen[pair] = struct{}{}
 		sources[targetID] = append(sources[targetID], sourceID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	built := &noteBacklinkIndex{revision: revision, sources: sources}
 	a.cacheMu.Lock()
@@ -339,18 +345,32 @@ func (a *App) buildNoteGraph() (NoteGraph, error) {
 	}
 	seenEdges := make(map[[3]int64]struct{})
 	connectedNotes := make(map[int64]struct{})
-	rows, err := a.readDB.Query(`SELECT source_id, target_key, kind
-		FROM note_links ORDER BY source_id, target_key, kind`)
-	if err != nil {
+	var raw string
+	if err := a.readDB.QueryRow(`SELECT COALESCE(group_concat(
+		source_id || ',' || length(CAST(kind AS BLOB)) || ',' || kind || ',' ||
+		length(CAST(target_key AS BLOB)) || ',' || target_key, ''), '')
+		FROM note_links`).Scan(&raw); err != nil {
 		return NoteGraph{}, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var sourceID int64
-		var targetKey, kind string
-		if err := rows.Scan(&sourceID, &targetKey, &kind); err != nil {
-			return NoteGraph{}, err
+	for pos := 0; pos < len(raw); {
+		sourceID, next, ok := readDecimalField(raw, pos)
+		if !ok {
+			return NoteGraph{}, errors.New("invalid note link payload")
 		}
+		kindLength, kindStart, ok := readDecimalField(raw, next)
+		if !ok || kindLength > int64(len(raw)-kindStart) {
+			return NoteGraph{}, errors.New("invalid note link payload")
+		}
+		kindEnd := kindStart + int(kindLength)
+		targetLength, targetStart, ok := readDecimalField(raw, kindEnd)
+		if !ok || targetLength > int64(len(raw)-targetStart) {
+			return NoteGraph{}, errors.New("invalid note link payload")
+		}
+		targetEnd := targetStart + int(targetLength)
+		kind := raw[kindStart:kindEnd]
+		targetKey := raw[targetStart:targetEnd]
+		pos = targetEnd
+
 		note, exists := notesByID[sourceID]
 		if !exists {
 			continue
@@ -367,9 +387,6 @@ func (a *App) buildNoteGraph() (NoteGraph, error) {
 		connectedNotes[note.ID] = struct{}{}
 		connectedNotes[targetID] = struct{}{}
 		graph.Edges = append(graph.Edges, GraphEdge{Source: note.ID, Target: targetID, Type: kind})
-	}
-	if err := rows.Err(); err != nil {
-		return NoteGraph{}, err
 	}
 	connectedNodes := graph.Nodes[:0]
 	for _, node := range graph.Nodes {
@@ -444,28 +461,82 @@ func (a *App) Backlinks(noteID int64) ([]NoteSummary, error) {
 }
 
 type noteQueryer interface {
-	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
 }
 
 func (a *App) readNotesForLinks() ([]indexedNote, error) {
 	return readNotesForLinksWith(a.readDB)
 }
 
+// readNotesForLinksWith reads the whole ID/title/folder index in one row.
+// SQLite calls back into cgo for every result row, which dominated this scan on
+// large libraries. Concatenating length-prefixed fields inside SQLite keeps the
+// result to a single callback without restricting what titles and folders may
+// contain.
 func readNotesForLinksWith(queryer noteQueryer) ([]indexedNote, error) {
-	rows, err := queryer.Query(`SELECT rowid, title, COALESCE(folder, '') FROM notes ORDER BY rowid`)
+	var raw string
+	err := queryer.QueryRow(`SELECT COALESCE(group_concat(
+		rowid || ',' ||
+		length(CAST(title AS BLOB)) || ',' ||
+		length(CAST(COALESCE(folder, '') AS BLOB)) || ',' ||
+		title || COALESCE(folder, ''), ''), '') FROM notes`).Scan(&raw)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	notes := make([]indexedNote, 0)
-	for rows.Next() {
-		var note indexedNote
-		if err := rows.Scan(&note.ID, &note.Title, &note.Folder); err != nil {
-			return nil, err
+	return parseIndexedNotes(raw)
+}
+
+func parseIndexedNotes(raw string) ([]indexedNote, error) {
+	notes := make([]indexedNote, 0, 128)
+	for pos := 0; pos < len(raw); {
+		id, next, ok := readDecimalField(raw, pos)
+		if !ok {
+			return nil, errors.New("invalid note index payload")
 		}
-		notes = append(notes, note)
+		titleLength, nextTitle, ok := readDecimalField(raw, next)
+		if !ok {
+			return nil, errors.New("invalid note index payload")
+		}
+		folderLength, nextFolder, ok := readDecimalField(raw, nextTitle)
+		if !ok {
+			return nil, errors.New("invalid note index payload")
+		}
+		end := int64(nextFolder) + titleLength + folderLength
+		if end > int64(len(raw)) {
+			return nil, errors.New("invalid note index payload")
+		}
+		titleStart := nextFolder
+		titleEnd := titleStart + int(titleLength)
+		notes = append(notes, indexedNote{GraphNode: GraphNode{
+			ID:     id,
+			Title:  raw[titleStart:titleEnd],
+			Folder: raw[titleEnd:int(end)],
+		}})
+		pos = int(end)
 	}
-	return notes, rows.Err()
+	return notes, nil
+}
+
+// readDecimalField parses an unsigned decimal followed by a comma. It returns
+// the value and the position right after the comma.
+func readDecimalField(raw string, start int) (int64, int, bool) {
+	value := int64(0)
+	pos := start
+	for pos < len(raw) && raw[pos] != ',' {
+		digit := raw[pos]
+		if digit < '0' || digit > '9' {
+			return 0, 0, false
+		}
+		if value > (1<<62)/10 {
+			return 0, 0, false
+		}
+		value = value*10 + int64(digit-'0')
+		pos++
+	}
+	if pos == start || pos == len(raw) {
+		return 0, 0, false
+	}
+	return value, pos + 1, true
 }
 
 func makeNoteLinkIndexes(notes []indexedNote) (map[string]int64, map[string]int64) {
@@ -477,9 +548,9 @@ func makeNoteLinkIndexes(notes []indexedNote) (map[string]int64, map[string]int6
 		if _, exists := byTitle[titleKey]; !exists {
 			byTitle[titleKey] = note.ID
 		}
-		fullPath := path.Join(note.Folder, title)
-		byPath[normalizeNoteLinkKey(fullPath)] = note.ID
-		byPath[normalizeNoteLinkKey(fullPath+".md")] = note.ID
+		// normalizeNoteLinkKey strips a trailing ".md", so the extension
+		// variant would produce the same key; one entry is enough.
+		byPath[normalizeNoteLinkKey(path.Join(note.Folder, title))] = note.ID
 	}
 	return byPath, byTitle
 }
@@ -1310,28 +1381,35 @@ func resolveNoteLinkPath(source indexedNote, target string, byPath, byTitle map[
 	}
 	absolute := strings.HasPrefix(target, "/")
 	target = strings.TrimPrefix(target, "/")
-	if strings.HasSuffix(strings.ToLower(target), ".md") {
+	if hasMarkdownExtension(target) {
 		target = target[:len(target)-3]
 	}
 	if target == "" || target == "." {
 		return 0
 	}
-	candidates := []string{target}
+	// Relative paths are tried first. Normalizing each candidate once is
+	// enough: normalizeNoteLinkKey already strips ".md", so looking up the
+	// extension variant again only repeated the same work.
 	if !absolute && source.Folder != "" {
 		relative := path.Clean(path.Join(source.Folder, target))
 		if relative != ".." && !strings.HasPrefix(relative, "../") {
-			candidates = append([]string{relative}, candidates...)
+			if id := byPath[normalizeNoteLinkKey(relative)]; id != 0 {
+				return id
+			}
 		}
 	}
-	for _, candidate := range candidates {
-		if id := byPath[normalizeNoteLinkKey(candidate)]; id != 0 {
-			return id
-		}
-		if id := byPath[normalizeNoteLinkKey(candidate+".md")]; id != 0 {
-			return id
-		}
+	if id := byPath[normalizeNoteLinkKey(target)]; id != 0 {
+		return id
 	}
 	return byTitle[normalizeNoteLinkKey(path.Base(target))]
+}
+
+func hasMarkdownExtension(value string) bool {
+	if len(value) < 3 || value[len(value)-3] != '.' {
+		return false
+	}
+	first, second := value[len(value)-2], value[len(value)-1]
+	return (first == 'm' || first == 'M') && (second == 'd' || second == 'D')
 }
 
 func normalizeNoteLinkKey(value string) string {

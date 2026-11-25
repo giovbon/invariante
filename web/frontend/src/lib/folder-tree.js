@@ -35,6 +35,44 @@ export function createFolderTree(context) {
     let folderTreeRefreshQueued = false;
     let folderTreeRevision = 0;
     let pendingTreeRevision = 0;
+
+    // Icons and row actions repeat for every folder and note. Cloning them from
+    // cached <template> nodes avoids re-parsing the same SVG markup hundreds
+    // of times when the explorer renders a large tree.
+    const templateCache = new Map();
+
+    function cloneTemplate(key, build) {
+        let template = templateCache.get(key);
+        if (!template) {
+            template = document.createElement('template');
+            template.content.append(build());
+            templateCache.set(key, template);
+        }
+        return template.content.firstElementChild.cloneNode(true);
+    }
+
+    const actionIcons = {
+        plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+        notePlus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3.75h8l4 4v12.5H6z"/><path d="M14 3.75v4h4M12 11v6m-3-3h6"/></svg>',
+        folderPlus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/><path d="M16 11v6m-3-3h6"/></svg>',
+        rename: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z"/><path d="m13.5 6.5 3 3"/></svg>',
+        remove: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3"/></svg>'
+    };
+
+    function actionButton({ className, icon, dataset, label, title }) {
+        const button = cloneTemplate(`action:${className}:${icon}`, () => {
+            const element = document.createElement('button');
+            element.type = 'button';
+            element.className = className;
+            element.innerHTML = actionIcons[icon];
+            return element;
+        });
+        Object.assign(button.dataset, dataset);
+        button.setAttribute('aria-label', label);
+        button.title = title;
+        return button;
+    }
+
 function visibleTreeNoteIDs() {
     return [...elements.panelContent.querySelectorAll('[data-tree-note]')]
         .map(button => Number(button.dataset.treeNote));
@@ -49,6 +87,12 @@ function updateTreeSelection() {
         const selected = state.treeSelection.has(Number(button.dataset.treeNote));
         button.classList.toggle('is-selected', selected);
         button.setAttribute('aria-pressed', String(selected));
+    });
+    // Folder rows (including the “Todas as notas” root) are selected through
+    // state.folder. Toggling the class avoids rebuilding the tree just to move
+    // the highlight after a click.
+    elements.panelContent.querySelectorAll('[data-folder]').forEach(button => {
+        button.classList.toggle('is-selected', button.dataset.folder === state.folder);
     });
 }
 
@@ -94,25 +138,27 @@ function renderFolderPanel() {
     all.textContent = 'Todas as notas';
     const actions = document.createElement('div');
     actions.className = 'tree-root-actions';
-    const createNote = document.createElement('button');
-    createNote.type = 'button';
-    createNote.className = 'icon-button tree-root-action';
-    createNote.dataset.createNote = '';
-    createNote.setAttribute('aria-label', 'Criar nota');
-    createNote.title = 'Criar nota';
-    createNote.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
-    const createFolder = document.createElement('button');
-    createFolder.type = 'button';
-    createFolder.className = 'icon-button tree-root-action';
-    createFolder.dataset.createFolder = '';
-    createFolder.setAttribute('aria-label', 'Criar pasta');
-    createFolder.title = 'Criar pasta';
-    createFolder.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/><path d="M16 11v6m-3-3h6"/></svg>';
-    actions.append(createNote, createFolder);
+    actions.append(
+        actionButton({
+            className: 'icon-button tree-root-action',
+            icon: 'plus',
+            dataset: { createNote: '' },
+            label: 'Criar nota',
+            title: 'Criar nota'
+        }),
+        actionButton({
+            className: 'icon-button tree-root-action',
+            icon: 'folderPlus',
+            dataset: { createFolder: '' },
+            label: 'Criar pasta',
+            title: 'Criar pasta'
+        })
+    );
     rootRow.append(all, actions);
     const root = document.createElement('section');
     root.className = 'tree-root-group';
     root.dataset.dropFolder = '';
+    root.dataset.treeRoot = 'true';
     const rootHeader = document.createElement('div');
     rootHeader.className = 'tree-row';
     const rootExpand = makeExpandButton('', 'Notas sem pasta');
@@ -127,7 +173,6 @@ function renderFolderPanel() {
     for (const folder of state.folders) tree.append(buildFolderNode(folder));
     elements.panelContent.replaceChildren(rootRow, root, tree);
     elements.panel.scrollTop = scrollTop;
-    updateTreeSelection();
 }
 
 function makeExpandButton(folderPath, label) {
@@ -143,16 +188,17 @@ function makeExpandButton(folderPath, label) {
 }
 
 function createTreeDocumentIcon(className) {
-    return iconElement('note', className, 'tree-document');
+    return cloneTemplate(`icon:note:${className}`, () => iconElement('note', className, 'tree-document'));
 }
 
 function createTreeFolderIcon(className) {
-    return iconElement('folder', className, 'tree-folder');
+    return cloneTemplate(`icon:folder:${className}`, () => iconElement('folder', className, 'tree-folder'));
 }
 
 function buildFolderNode(folder) {
     const item = document.createElement('li');
     item.className = 'tree-node';
+    item.dataset.treeFolderPath = folder.path;
     const row = document.createElement('div');
     row.className = 'tree-row';
     row.append(makeExpandButton(folder.path, folder.name));
@@ -170,51 +216,132 @@ function buildFolderNode(folder) {
     row.append(select);
     const actions = document.createElement('div');
     actions.className = 'tree-folder-actions';
-    const rename = document.createElement('button');
-    rename.type = 'button';
-    rename.className = 'icon-button tree-folder-action';
-    rename.dataset.renameFolder = folder.path;
-    rename.setAttribute('aria-label', `Editar título de ${folder.name}`);
-    rename.title = 'Editar título';
-    rename.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z"/><path d="m13.5 6.5 3 3"/></svg>';
-    const createNote = document.createElement('button');
-    createNote.type = 'button';
-    createNote.className = 'icon-button tree-folder-action';
-    createNote.dataset.createNoteFolder = folder.path;
-    createNote.setAttribute('aria-label', `Criar nota em ${folder.path}`);
-    createNote.title = `Criar nota em ${folder.path}`;
-    createNote.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3.75h8l4 4v12.5H6z"/><path d="M14 3.75v4h4M12 11v6m-3-3h6"/></svg>';
-    const createSubfolder = document.createElement('button');
-    createSubfolder.type = 'button';
-    createSubfolder.className = 'icon-button tree-folder-action';
-    createSubfolder.dataset.createSubfolder = folder.path;
-    createSubfolder.setAttribute('aria-label', `Criar subpasta em ${folder.path}`);
-    createSubfolder.title = `Criar subpasta em ${folder.path}`;
-    createSubfolder.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/><path d="M16 11v6m-3-3h6"/></svg>';
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'icon-button tree-folder-action tree-folder-delete';
-    remove.dataset.deleteFolder = folder.path;
-    remove.setAttribute('aria-label', `Excluir pasta ${folder.name}`);
-    remove.title = 'Excluir pasta';
-    remove.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3"/></svg>';
-    actions.append(rename, createNote, createSubfolder, remove);
+    actions.append(
+        actionButton({
+            className: 'icon-button tree-folder-action',
+            icon: 'rename',
+            dataset: { renameFolder: folder.path },
+            label: `Editar título de ${folder.name}`,
+            title: 'Editar título'
+        }),
+        actionButton({
+            className: 'icon-button tree-folder-action',
+            icon: 'notePlus',
+            dataset: { createNoteFolder: folder.path },
+            label: `Criar nota em ${folder.path}`,
+            title: `Criar nota em ${folder.path}`
+        }),
+        actionButton({
+            className: 'icon-button tree-folder-action',
+            icon: 'folderPlus',
+            dataset: { createSubfolder: folder.path },
+            label: `Criar subpasta em ${folder.path}`,
+            title: `Criar subpasta em ${folder.path}`
+        }),
+        actionButton({
+            className: 'icon-button tree-folder-action tree-folder-delete',
+            icon: 'remove',
+            dataset: { deleteFolder: folder.path },
+            label: `Excluir pasta ${folder.name}`,
+            title: 'Excluir pasta'
+        })
+    );
     row.append(actions);
     item.append(row);
-    if (state.expandedFolders.has(folder.path)) {
-        const contents = document.createElement('ul');
-        contents.className = 'folder-tree';
-        const directNotes = renderDirectNotes(folder.path, false);
-        while (directNotes.firstChild) contents.append(directNotes.firstChild);
-        for (const child of folder.children || []) contents.append(buildFolderNode(child));
-        item.append(contents);
-    }
+    if (state.expandedFolders.has(folder.path)) item.append(buildFolderContents(folder));
     return item;
+}
+
+function buildFolderContents(folder) {
+    const contents = document.createElement('ul');
+    contents.className = 'folder-tree';
+    contents.dataset.folderContents = folder.path;
+    const directNotes = renderDirectNotes(folder.path, false);
+    while (directNotes.firstChild) contents.append(directNotes.firstChild);
+    for (const child of folder.children || []) contents.append(buildFolderNode(child));
+    return contents;
+}
+
+function findFolder(path) {
+    function search(folders) {
+        for (const folder of folders) {
+            if (folder.path === path) return folder;
+            const match = search(folder.children || []);
+            if (match) return match;
+        }
+        return null;
+    }
+    return search(state.folders);
+}
+
+function findFolderItem(path) {
+    return [...elements.panelContent.querySelectorAll('[data-tree-folder-path]')]
+        .find(item => item.dataset.treeFolderPath === path) || null;
+}
+
+function directChild(element, selector) {
+    return [...element.children].find(child => child.matches(selector)) || null;
+}
+
+function applyToggleState(toggle, expanded, label) {
+    toggle.setAttribute('aria-expanded', String(expanded));
+    toggle.setAttribute('aria-label', `${expanded ? 'Recolher' : 'Expandir'} ${label}`);
+}
+
+// Expand or collapse one node in place. Rebuilding only that subtree keeps the
+// rest of a large explorer intact instead of recreating every folder and note
+// on each click.
+function setExpanded(path, expanded) {
+    if (path === '') {
+        const root = elements.panelContent.querySelector('[data-tree-root]');
+        if (!root) return false;
+        const toggle = root.querySelector('.tree-row [data-toggle-folder]');
+        if (!toggle) return false;
+        const current = root.querySelector('[data-root-notes]');
+        if (expanded && !current) root.append(renderDirectNotes('', true));
+        else if (!expanded && current) current.remove();
+        applyToggleState(toggle, expanded, 'Notas sem pasta');
+        return true;
+    }
+    const item = findFolderItem(path);
+    const folder = item && findFolder(path);
+    if (!item || !folder) return false;
+    const row = directChild(item, '.tree-row');
+    const toggle = row && row.querySelector('[data-toggle-folder]');
+    if (!toggle) return false;
+    const current = directChild(item, 'ul[data-folder-contents]');
+    if (expanded && !current) item.append(buildFolderContents(folder));
+    else if (!expanded && current) current.remove();
+    applyToggleState(toggle, expanded, folder.name);
+    return true;
+}
+
+// Replace the notes of one expanded folder after a page loads or grows.
+function refreshFolder(path) {
+    if (!state.expandedFolders.has(path)) return false;
+    if (path === '') {
+        const root = elements.panelContent.querySelector('[data-tree-root]');
+        if (!root) return false;
+        const notes = renderDirectNotes('', true);
+        const current = root.querySelector('[data-root-notes]');
+        if (current) current.replaceWith(notes);
+        else root.append(notes);
+        return true;
+    }
+    const folder = findFolder(path);
+    const item = findFolderItem(path);
+    if (!folder || !item) return false;
+    const contents = buildFolderContents(folder);
+    const current = directChild(item, 'ul[data-folder-contents]');
+    if (current) current.replaceWith(contents);
+    else item.append(contents);
+    return true;
 }
 
 function renderDirectNotes(folder, root) {
     const list = document.createElement(root ? 'div' : 'ul');
     list.className = root ? 'tree-note-list root-note-list' : 'folder-tree-note-list';
+    if (root) list.dataset.rootNotes = 'true';
     const page = state.folderNotes.get(folder);
     if (!page) {
         void loadFolderNotes(folder);
@@ -243,21 +370,22 @@ function renderDirectNotes(folder, root) {
         button.append(createTreeDocumentIcon('tree-note-icon'), label);
         const actions = document.createElement('div');
         actions.className = 'tree-note-actions';
-        const rename = document.createElement('button');
-        rename.type = 'button';
-        rename.className = 'icon-button tree-note-action';
-        rename.dataset.renameNote = String(note.id);
-        rename.setAttribute('aria-label', `Editar título de ${note.title}`);
-        rename.title = 'Editar título';
-        rename.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z"/><path d="m13.5 6.5 3 3"/></svg>';
-        const remove = document.createElement('button');
-        remove.type = 'button';
-        remove.className = 'icon-button tree-note-action tree-note-delete';
-        remove.dataset.deleteTreeNote = String(note.id);
-        remove.setAttribute('aria-label', `Excluir ${note.title}`);
-        remove.title = 'Excluir nota';
-        remove.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3"/></svg>';
-        actions.append(rename, remove);
+        actions.append(
+            actionButton({
+                className: 'icon-button tree-note-action',
+                icon: 'rename',
+                dataset: { renameNote: String(note.id) },
+                label: `Editar título de ${note.title}`,
+                title: 'Editar título'
+            }),
+            actionButton({
+                className: 'icon-button tree-note-action tree-note-delete',
+                icon: 'remove',
+                dataset: { deleteTreeNote: String(note.id) },
+                label: `Excluir ${note.title}`,
+                title: 'Excluir nota'
+            })
+        );
         item.append(button, actions);
         list.append(item);
     }
@@ -670,14 +798,14 @@ async function selectFolder(folder) {
     if (window.matchMedia('(max-width: 700px)').matches) closePanel();
     loadNotes();
     updateListHistory();
-    if (elements.panel.dataset.panel === 'files') renderFolderPanel();
+    if (elements.panel.dataset.panel === 'files') updateTreeSelection();
 }
-
-
 
     return {
         render: renderFolderPanel,
         refresh: refreshFolderTree,
+        setExpanded,
+        refreshFolder,
         noteRevision(revision) {
             if (Number.isFinite(revision) && revision > folderTreeRevision) {
                 folderTreeRevision = revision;

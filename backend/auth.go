@@ -7,8 +7,12 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,8 +20,11 @@ import (
 )
 
 const (
-	authCookieName   = "pkm_notes_session"
-	authSessionTTL   = 12 * time.Hour
+	authCookieName = "pkm_notes_session"
+	// authSessionTTL is the default lifetime of a login cookie. A long-lived
+	// cookie together with the persisted signing key keeps a local install
+	// from asking for the password every time the server restarts.
+	authSessionTTL   = 30 * 24 * time.Hour
 	authFailureTTL   = 15 * time.Minute
 	authFailureLimit = 5
 )
@@ -30,21 +37,71 @@ type loginFailures struct {
 type authenticator struct {
 	password string
 	key      []byte
+	ttl      time.Duration
 	secure   bool
 	mu       sync.Mutex
 	failures map[string]loginFailures
 }
 
-func newAuthenticator(password string) (*authenticator, error) {
+// newAuthenticator creates an authenticator. When keyPath is not empty and a
+// password is configured, the signing key is read from that file (or created
+// there with 0600 permissions) so existing sessions survive server restarts.
+// The signing key is derived from the persisted secret and the password, so
+// changing AUTHENTICATION_PASSWORD invalidates old sessions.
+func newAuthenticator(password, keyPath string) (*authenticator, error) {
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, err
 	}
+	if password != "" && keyPath != "" {
+		secret, err := loadOrCreateAuthKey(keyPath)
+		if err != nil {
+			return nil, err
+		}
+		mac := hmac.New(sha256.New, secret)
+		_, _ = mac.Write([]byte(password))
+		key = mac.Sum(nil)
+	}
 	return &authenticator{
 		password: password,
 		key:      key,
+		ttl:      authSessionTTL,
 		failures: make(map[string]loginFailures),
 	}, nil
+}
+
+func loadOrCreateAuthKey(path string) ([]byte, error) {
+	raw, err := os.ReadFile(path)
+	if err == nil {
+		secret, decodeErr := hex.DecodeString(strings.TrimSpace(string(raw)))
+		if decodeErr != nil || len(secret) < 32 {
+			return nil, fmt.Errorf("invalid authentication key file %s", path)
+		}
+		return secret, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, fs.ErrExist) {
+		return loadOrCreateAuthKey(path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err := file.WriteString(hex.EncodeToString(secret) + "\n"); err != nil {
+		file.Close()
+		os.Remove(path)
+		return nil, err
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
+	}
+	return secret, nil
 }
 
 func randomHex(byteCount int) (string, error) {
@@ -116,7 +173,7 @@ func (a *authenticator) login(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		Secure:   a.secure || r.TLS != nil,
 		SameSite: http.SameSiteStrictMode,
-		MaxAge:   int(authSessionTTL.Seconds()),
+		MaxAge:   int(a.ttl.Seconds()),
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
 }
@@ -181,7 +238,7 @@ func (a *authenticator) newSessionToken(now time.Time) (string, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-	payload := strconv.FormatInt(now.Add(authSessionTTL).Unix(), 10) + ":" + hex.EncodeToString(nonce)
+	payload := strconv.FormatInt(now.Add(a.ttl).Unix(), 10) + ":" + hex.EncodeToString(nonce)
 	encoded := base64.RawURLEncoding.EncodeToString([]byte(payload))
 	mac := hmac.New(sha256.New, a.key)
 	_, _ = mac.Write([]byte(encoded))
@@ -216,7 +273,7 @@ func (a *authenticator) validSessionToken(token string, now time.Time) bool {
 		return false
 	}
 	expiration := time.Unix(expiry, 0)
-	return expiration.After(now) && !expiration.After(now.Add(authSessionTTL+time.Minute))
+	return expiration.After(now) && !expiration.After(now.Add(a.ttl+time.Minute))
 }
 
 func (a *authenticator) isRateLimited(ip string) bool {

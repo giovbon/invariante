@@ -296,7 +296,7 @@ func TestAuthenticationProtectsAPIAndSupportsLoginLogout(t *testing.T) {
 }
 
 func TestExpiredAndTamperedAuthenticationTokensAreRejected(t *testing.T) {
-	auth, err := newAuthenticator("password")
+	auth, err := newAuthenticator("password", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,6 +313,59 @@ func TestExpiredAndTamperedAuthenticationTokensAreRejected(t *testing.T) {
 	}
 	if auth.validSessionToken(valid+"tampered", time.Now()) {
 		t.Fatal("tampered session token was accepted")
+	}
+}
+
+func TestPersistedAuthKeyKeepsSessionsAcrossRestarts(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "auth.key")
+	first, err := newAuthenticator("password", keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0600 {
+		t.Fatalf("auth key permissions = %o, want 600", mode)
+	}
+	token, err := first.newSessionToken(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := newAuthenticator("password", keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restarted.validSessionToken(token, time.Now()) {
+		t.Fatal("session token was rejected after a restart with the same key")
+	}
+
+	changedPassword, err := newAuthenticator("other-password", keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedPassword.validSessionToken(token, time.Now()) {
+		t.Fatal("session token survived a password change")
+	}
+}
+
+func TestAuthenticationSessionTTLFromEnvironment(t *testing.T) {
+	t.Setenv("AUTHENTICATION_PASSWORD", "password")
+	t.Setenv("AUTHENTICATION_SESSION_TTL", "48h")
+	app, err := NewApp(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	if app.auth.ttl != 48*time.Hour {
+		t.Fatalf("session ttl = %v, want 48h", app.auth.ttl)
+	}
+
+	t.Setenv("AUTHENTICATION_SESSION_TTL", "not-a-duration")
+	if _, err := NewApp(t.TempDir()); err == nil {
+		t.Fatal("invalid AUTHENTICATION_SESSION_TTL was accepted")
 	}
 }
 

@@ -812,7 +812,20 @@ export function frontmatterLineOffset(content) {
     return content.split('\n').length - stripFrontmatter(content).split('\n').length;
 }
 
+// parseFrontmatter is called more than once per keystroke (note type and the
+// properties panel). Splitting the whole document every time is wasteful, so
+// the last result is reused while the text is unchanged. Callers only read the
+// returned metadata.
+let parsedFrontmatterCache = null;
+
 export function parseFrontmatter(content) {
+    if (parsedFrontmatterCache?.content === content) return parsedFrontmatterCache.metadata;
+    const metadata = parseFrontmatterUncached(content);
+    parsedFrontmatterCache = { content, metadata };
+    return metadata;
+}
+
+function parseFrontmatterUncached(content) {
     const lines = content.split('\n');
     if (lines[0]?.trim() !== '---') return null;
     const closeIndex = lines.findIndex((line, index) => index > 0 && ['---', '...'].includes(line.trim()));

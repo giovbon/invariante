@@ -36,7 +36,7 @@ Para exigir senha, defina `AUTHENTICATION_PASSWORD` antes de iniciar:
 AUTHENTICATION_PASSWORD='uma-senha-forte' ./run.sh
 ```
 
-O login protege a interface principal e os endpoints da API, exceto `GET /api/health` e as rotas de login/status/logout. A sessão usa cookie HttpOnly/SameSite Strict, expira em 12 horas e é invalidada quando o servidor reinicia. Após cinco senhas incorretas do mesmo endereço IP, novas tentativas são limitadas por 15 minutos. Sem `AUTHENTICATION_PASSWORD`, o app permanece sem autenticação.
+O login protege a interface principal e os endpoints da API, exceto `GET /api/health` e as rotas de login/status/logout. A sessão usa cookie HttpOnly/SameSite Strict e dura 30 dias por padrão. A chave que assina a sessão fica em `auth.key` no diretório de dados (permissão `0600`), então reiniciar o servidor não exige novo login; trocar `AUTHENTICATION_PASSWORD` invalida as sessões antigas. Para ajustar a duração, use um valor de duração do Go, como `AUTHENTICATION_SESSION_TTL=720h`; sessões não são renovadas automaticamente a cada requisição. Após cinco senhas incorretas do mesmo endereço IP, novas tentativas são limitadas por 15 minutos. Sem `AUTHENTICATION_PASSWORD`, o app permanece sem autenticação.
 
 Use uma senha forte e HTTPS quando o app estiver acessível pela rede. Se HTTPS terminar em um proxy reverso, force o atributo Secure do cookie:
 

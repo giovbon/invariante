@@ -1,4 +1,4 @@
-import { stripFrontmatter, frontmatterLineOffset, parseFrontmatter, isMarkmapNote } from './markdown-editor.js';
+import { stripFrontmatter, parseFrontmatter, isMarkmapNote } from './markdown-editor.js';
 import { estimateSourceLine, getScrollSpacerHeight, mapEditorToPreview, mapPreviewToEditor } from './scroll-sync.js';
 import { highlightCode } from './syntax-highlight.js';
 import { findLinkOccurrence, linkTargetMatches } from './note-links.js';
@@ -23,11 +23,28 @@ function previewContextKey(state) {
     ].join('\x00');
 }
 
+let sourceCache = null;
+
+// stripFrontmatter and the frontmatter line count both split the whole
+// document. The scroll sync asks for them on every frame, so keep the result
+// of the last document around instead of re-parsing it repeatedly.
+function deriveSource(content) {
+    if (sourceCache?.content === content) return sourceCache;
+    const markdown = stripFrontmatter(content);
+    sourceCache = {
+        content,
+        markdown,
+        offset: content.split('\n').length - markdown.split('\n').length
+    };
+    return sourceCache;
+}
+
 // Preview rendering, editor/reading modes and bidirectional scroll sync.
 export function createEditorPreview({ state, elements, closePanel }) {
-    let previewTimer;
+    let previewTimer = 0;
     let previewRequestID = 0;
     let previewAbortController = null;
+    let previewInFlight = null;
     let renderedPreviewMarkdown = '';
     let renderedPreviewContext = '';
     let editorLinePositionCache = null;
@@ -102,14 +119,14 @@ function resetMarkmapPreview() {
     }
 }
 
-function scheduleMarkmapPreview(markdown, requestID) {
+function scheduleMarkmapPreview(markdown, requestID, immediate = false) {
     elements.markdownPreview.classList.add('is-markmap');
     elements.markdownPreview.dataset.noteType = 'markmap';
     window.clearTimeout(markmapTimer);
     markmapTimer = window.setTimeout(() => {
         markmapTimer = 0;
         void drawMarkmapPreview(markdown, requestID);
-    }, 140);
+    }, immediate ? 0 : 140);
 }
 
 async function drawMarkmapPreview(markdown, requestID) {
@@ -193,26 +210,36 @@ function highlightPreviewCode() {
 }
 
 
-function updatePreview() {
+function cancelPreviewRequest() {
+    window.clearTimeout(previewTimer);
+    previewTimer = 0;
+    previewAbortController?.abort();
+    previewAbortController = null;
+    previewInFlight = null;
+}
+
+// `immediate` skips the typing debounce. Opening a note or switching to a
+// reading mode has nothing to coalesce, so waiting only adds latency.
+function updatePreview({ immediate = false } = {}) {
+    const content = elements.noteContent.value;
     // Cancel the previous render before scheduling another one. Discarding the
     // response was not enough: the server kept parsing stale documents while
     // the user kept typing.
-    previewAbortController?.abort();
-    previewAbortController = null;
     if (elements.editorWorkspace.dataset.editorMode === 'edit') {
+        cancelPreviewRequest();
         runPendingBacklink();
         return;
     }
-    const requestID = ++previewRequestID;
-    window.clearTimeout(previewTimer);
-    const content = elements.noteContent.value;
-    const markdown = stripFrontmatter(content);
+    const markdown = deriveSource(content).markdown;
     if (isMarkmapNote(content)) {
-        scheduleMarkmapPreview(markdown, requestID);
+        cancelPreviewRequest();
+        scheduleMarkmapPreview(markdown, ++previewRequestID, immediate);
         return;
     }
     resetMarkmapPreview();
     if (!markdown.trim()) {
+        cancelPreviewRequest();
+        previewRequestID++;
         elements.markdownPreview.textContent = '';
         renderFrontmatterProperties();
         renderedPreviewMarkdown = markdown;
@@ -228,7 +255,10 @@ function updatePreview() {
     // The server round-trip is only needed when the body or the note context
     // actually changed. Frontmatter is not part of the preview HTML, so it is
     // refreshed even when the stripped Markdown is identical.
-    if (markdown === renderedPreviewMarkdown && previewContextKey(state) === renderedPreviewContext) {
+    const contextKey = previewContextKey(state);
+    if (markdown === renderedPreviewMarkdown && contextKey === renderedPreviewContext) {
+        cancelPreviewRequest();
+        previewRequestID++;
         renderFrontmatterProperties();
         syncPreviewMinimumHeight();
         syncEditorScrollFromSource();
@@ -236,9 +266,17 @@ function updatePreview() {
         runPendingTaskLine();
         return;
     }
+    // The same document may be requested twice in a row (for example when a
+    // note is opened and the mode is applied right after). Reusing the request
+    // in flight avoids aborting it and starting the server work over.
+    if (previewInFlight?.markdown === markdown && previewInFlight?.context === contextKey) return;
+
+    cancelPreviewRequest();
+    const requestID = ++previewRequestID;
     const controller = new AbortController();
     previewAbortController = controller;
-    previewTimer = window.setTimeout(async () => {
+    previewInFlight = { markdown, context: contextKey };
+    const renderPreview = async () => {
         try {
             const response = await fetch('/api/preview', {
                 method: 'POST',
@@ -261,7 +299,7 @@ function updatePreview() {
                 renderFrontmatterProperties();
                 syncPreviewMinimumHeight();
                 renderedPreviewMarkdown = markdown;
-                renderedPreviewContext = previewContextKey(state);
+                renderedPreviewContext = contextKey;
                 annotatePreviewLandmarks(markdown);
                 const readingLine = pendingReadingLine;
                 pendingReadingLine = null;
@@ -292,8 +330,15 @@ function updatePreview() {
             }
         } finally {
             if (previewAbortController === controller) previewAbortController = null;
+            if (previewInFlight?.markdown === markdown && previewInFlight?.context === contextKey) {
+                previewInFlight = null;
+            }
         }
-    }, previewDelay(markdown));
+    };
+    // Starting the request synchronously lets the server work in parallel with
+    // the editor's highlight rebuild that runs right after a note is opened.
+    if (immediate) void renderPreview();
+    else previewTimer = window.setTimeout(renderPreview, previewDelay(markdown));
 }
 
 function renderFrontmatterProperties() {
@@ -556,9 +601,8 @@ function measureEditorLines(markdown, lines) {
 
 function getScrollLandmarks() {
     if (isMarkmapPreview()) return [];
-    const content = elements.noteContent.value;
-    const markdown = stripFrontmatter(content);
-    if (renderedPreviewMarkdown !== markdown) return [];
+    const source = deriveSource(elements.noteContent.value);
+    if (renderedPreviewMarkdown !== source.markdown) return [];
     const editor = elements.noteContent;
     const preview = elements.markdownPreview;
     const editorScrollable = Math.max(0, editor.scrollHeight - editor.clientHeight);
@@ -567,12 +611,15 @@ function getScrollLandmarks() {
     // Preview source lines are relative to the stripped body, but the editor
     // textarea still contains the frontmatter, so the measured line tops need
     // to be shifted by the removed lines to match the real editor scroll.
-    const sourceLineOffset = frontmatterLineOffset(content);
-    const sourceLines = [...elements.markdownPreview.querySelectorAll('[data-source-line]')]
-        .map(element => Number(element.dataset.sourceLine));
-    const positions = measureEditorLines(content, sourceLines.map(line => line + sourceLineOffset));
+    const sourceLineOffset = source.offset;
+    const blocks = [...elements.markdownPreview.querySelectorAll('[data-source-line]')];
+    if (!blocks.length) return [];
+    const positions = measureEditorLines(
+        source.content,
+        blocks.map(element => Number(element.dataset.sourceLine) + sourceLineOffset)
+    );
     const previewRect = preview.getBoundingClientRect();
-    return [...elements.markdownPreview.querySelectorAll('[data-source-line]')]
+    return blocks
         .map(element => {
             const sourceY = positions.get(Number(element.dataset.sourceLine) + sourceLineOffset);
             const previewTop = element.getBoundingClientRect().top - previewRect.top + preview.scrollTop;
@@ -593,8 +640,8 @@ function previewAnchorSourceLine() {
     if (!preview || preview.clientHeight === 0) return null;
     // The mind map has no source-line landmarks to map the scroll back.
     if (isMarkmapPreview()) return null;
-    const content = elements.noteContent.value;
-    const offset = frontmatterLineOffset(content);
+    const source = deriveSource(elements.noteContent.value);
+    const offset = source.offset;
     const previewRect = preview.getBoundingClientRect();
     const scrollTop = preview.scrollTop;
     const landmarks = [];
@@ -607,7 +654,7 @@ function previewAnchorSourceLine() {
             top: element.getBoundingClientRect().top - previewRect.top + scrollTop
         });
     }
-    const bodyLineCount = Math.max(0, content.split('\n').length - offset);
+    const bodyLineCount = Math.max(0, source.markdown.split('\n').length);
     const scrollable = Math.max(0, preview.scrollHeight - preview.clientHeight);
     const fallback = scrollable > 0 ? (scrollTop / scrollable) * bodyLineCount : 0;
     const bodyLine = estimateSourceLine(scrollTop, landmarks, fallback);
@@ -640,7 +687,9 @@ function handleEditorScroll(source) {
         const source = pendingScrollSource;
         pendingScrollSource = null;
         if (!source) return;
-        const landmarks = getScrollLandmarks();
+        // At the very top the mapping is always zero; measuring every landmark
+        // there only costs layout work while a long note is opening.
+        const landmarks = source.scrollTop <= 0 ? [] : getScrollLandmarks();
         const fromEditor = source === elements.noteContent;
         const sourceScrollable = Math.max(0, source.scrollHeight - source.clientHeight);
         const target = fromEditor ? elements.markdownPreview : elements.noteContent;
@@ -666,7 +715,7 @@ function syncEditorScrollFromSource() {
         editor.scrollTop,
         Math.max(0, editor.scrollHeight - editor.clientHeight),
         Math.max(0, preview.scrollHeight - preview.clientHeight),
-        getScrollLandmarks()
+        editor.scrollTop <= 0 ? [] : getScrollLandmarks()
     );
     if (Math.abs(preview.scrollTop - targetTop) >= 1) {
         programmaticScroll = { element: preview, scrollTop: targetTop };
@@ -679,7 +728,7 @@ function updateEditorHistoryButtons({ canUndo, canRedo }) {
     document.querySelector('[data-action="redo"]').disabled = !canRedo;
 }
 
-function setEditorMode(mode) {
+function setEditorMode(mode, { render = true } = {}) {
     if (mode === 'split' && window.matchMedia('(max-width: 700px)').matches) mode = 'edit';
     const previousMode = elements.editorWorkspace.dataset.editorMode;
     if (previousMode === mode) return;
@@ -703,8 +752,9 @@ function setEditorMode(mode) {
         previewRequestID++;
         previewAbortController?.abort();
         previewAbortController = null;
-    } else if (previewNeedsRender) {
-        updatePreview();
+        previewInFlight = null;
+    } else if (previewNeedsRender && render) {
+        updatePreview({ immediate: true });
     }
     requestAnimationFrame(() => {
         syncPreviewMinimumHeight();
@@ -721,7 +771,7 @@ function setEditorMode(mode) {
 
 function scrollPreviewToSourceLine(lineIndex) {
     if (isMarkmapPreview()) return false;
-    const bodyLine = Math.max(0, lineIndex - frontmatterLineOffset(elements.noteContent.value));
+    const bodyLine = Math.max(0, lineIndex - deriveSource(elements.noteContent.value).offset);
     const blocks = [...elements.markdownPreview.querySelectorAll('[data-source-line]')];
     let target = null;
     for (const block of blocks) {
@@ -736,7 +786,7 @@ function scrollPreviewToSourceLine(lineIndex) {
 }
 
 function previewSourceReady() {
-    return renderedPreviewMarkdown === stripFrontmatter(elements.noteContent.value);
+    return renderedPreviewMarkdown === deriveSource(elements.noteContent.value).markdown;
 }
 
 function jumpToSourceLine(lineIndex) {
@@ -848,7 +898,7 @@ function scrollToOutlineHeading(line) {
     if (!heading) return;
     if (window.matchMedia('(max-width: 700px)').matches) closePanel();
     const mode = elements.editorWorkspace.dataset.editorMode;
-    if (mode !== 'edit' && renderedPreviewMarkdown !== stripFrontmatter(elements.noteContent.value)) {
+    if (mode !== 'edit' && renderedPreviewMarkdown !== deriveSource(elements.noteContent.value).markdown) {
         state.pendingOutlineLine = lineIndex;
         updatePreview();
         return;
@@ -877,14 +927,13 @@ function scrollToOutlineHeading(line) {
         runPendingTaskLine,
         runPendingBacklink,
         resetViewState() {
-            window.clearTimeout(previewTimer);
+            cancelPreviewRequest();
             previewRequestID++;
-            previewAbortController?.abort();
-            previewAbortController = null;
             resetMarkmapPreview();
             renderedPreviewMarkdown = '';
             renderedPreviewContext = '';
             editorLinePositionCache = null;
+            sourceCache = null;
             scrollSyncSuspendedUntil = 0;
             programmaticScroll = null;
             pendingReadingLine = null;
